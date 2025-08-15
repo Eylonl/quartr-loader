@@ -1,20 +1,31 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import fitz  # PyMuPDF
-from supabase import create_client
-from typing import Optional, List, Dict, Any
 
 load_dotenv()
-app = FastAPI(title="Quartr Loader", version="1.0")
 
-SB = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-BUCKET = os.getenv("SUPABASE_BUCKET", "earnings")
+app = FastAPI(title="Quartr Loader", version="1.1")
 
-LABELS = [("Transcript","transcript"),("Press Release","press_release"),("Presentation","presentation")]
+# ---------- Env helpers ----------
+def get_env(name: str, required: bool = True, default: str | None = None) -> str | None:
+    val = os.getenv(name, default)
+    if required and not val:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return val
 
+def supabase_client_server():
+    from supabase import create_client
+    url = get_env("SUPABASE_URL")
+    key = get_env("SUPABASE_SERVICE_ROLE_KEY")
+    return create_client(url, key)
+
+def bucket_name() -> str:
+    return os.getenv("SUPABASE_BUCKET", "earnings")
+
+# ---------- Utility ----------
 def pdf_bytes_to_text(b: bytes) -> str:
     with fitz.open(stream=b, filetype="pdf") as doc:
         return "\n".join(p.get_text() for p in doc).strip()
@@ -23,6 +34,8 @@ def path_for(ticker: str, year: int, quarter: str, file_type: str) -> str:
     return f"pdfs/{ticker.upper()}/{year}-{quarter}/{file_type}.pdf"
 
 def file_exists(storage_path: str) -> bool:
+    SB = supabase_client_server()
+    BUCKET = bucket_name()
     parent, name = storage_path.rsplit("/", 1)
     try:
         entries = SB.storage.from_(BUCKET).list(path=parent)
@@ -31,8 +44,12 @@ def file_exists(storage_path: str) -> bool:
         return False
 
 def upsert_row(**row):
-    SB.table("earnings_files").upsert(row, on_conflict="ticker,year,quarter,file_type,file_format").execute()
+    SB = supabase_client_server()
+    SB.table("earnings_files").upsert(
+        row, on_conflict="ticker,year,quarter,file_type,file_format"
+    ).execute()
 
+# ---------- Quartr steps ----------
 def login(page, email, password):
     page.goto("https://quartr.com/login", wait_until="networkidle")
     page.get_by_placeholder("Email").fill(email)
@@ -71,6 +88,11 @@ def download_label(page, label_text: str):
     except PWTimeoutError:
         return None, None
 
+# ---------- API ----------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 class BackfillRequest(BaseModel):
     ticker: str
     start_year: int
@@ -80,41 +102,58 @@ class BackfillRequest(BaseModel):
 
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
-    email = os.environ["QUARTR_EMAIL"]
-    password = os.environ["QUARTR_PASSWORD"]
+    try:
+        email = get_env("QUARTR_EMAIL")
+        password = get_env("QUARTR_PASSWORD")
+        _ = supabase_client_server()  # validates SUPABASE_URL + SERVICE_ROLE
+        BUCKET = bucket_name()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     def qn(q): return int(q.replace("Q",""))
     headless = True
-    args = ["--no-sandbox","--disable-dev-shm-usage"]
+    args = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+    SB = supabase_client_server()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=args)
-        ctx = browser.new_context(accept_downloads=True)
-        page = ctx.new_page()
-        login(page, email, password)
+            browser = p.chromium.launch(headless=headless, args=args)
+            ctx = browser.new_context(accept_downloads=True)
+            page = ctx.new_page()
+            login(page, email, password)
 
-        open_company(page, req.ticker)
-        for year in range(req.start_year, req.end_year+1):
-            q_start = qn(req.start_q) if year == req.start_year else 1
-            q_end = qn(req.end_q) if year == req.end_year else 4
-            for qi in range(q_start, q_end+1):
-                q = f"Q{qi}"
-                if not open_quarter(page, year, q):
-                    continue
-                for label, ftype in LABELS:
-                    key = path_for(req.ticker, year, q, ftype)
-                    if file_exists(key):
+            LABELS = [("Transcript","transcript"),("Press Release","press_release"),("Presentation","presentation")]
+
+            open_company(page, req.ticker)
+            for year in range(req.start_year, req.end_year + 1):
+                q_start = qn(req.start_q) if year == req.start_year else 1
+                q_end = qn(req.end_q) if year == req.end_year else 4
+                for qi in range(q_start, q_end + 1):
+                    q = f"Q{qi}"
+                    if not open_quarter(page, year, q):
                         continue
-                    b, url = download_label(page, label)
-                    if not b:
-                        continue
-                    SB.storage.from_(BUCKET).upload(key, b, {"content-type":"application/pdf","upsert":True})
-                    text = pdf_bytes_to_text(b)
-                    upsert_row(ticker=req.ticker.upper(), year=year, quarter=q,
-                               file_type=ftype, file_format="pdf", storage_path=key,
-                               source_url=url, text_content=None)
-                    upsert_row(ticker=req.ticker.upper(), year=year, quarter=q,
-                               file_type=ftype, file_format="text", storage_path=None,
-                               source_url=url, text_content=text)
-        ctx.close(); browser.close()
-    return {"status":"ok"}
+                    for label, ftype in LABELS:
+                        key = path_for(req.ticker, year, q, ftype)
+                        if file_exists(key):
+                            continue
+                        b, url = download_label(page, label)
+                        if not b:
+                            continue
+                        SB.storage.from_(BUCKET).upload(
+                            key, b, {"content-type": "application/pdf", "upsert": True}
+                        )
+                        text = pdf_bytes_to_text(b)
+                        upsert_row(
+                            ticker=req.ticker.upper(), year=year, quarter=q,
+                            file_type=ftype, file_format="pdf", storage_path=key,
+                            source_url=url, text_content=None
+                        )
+                        upsert_row(
+                            ticker=req.ticker.upper(), year=year, quarter=q,
+                            file_type=ftype, file_format="text", storage_path=None,
+                            source_url=url, text_content=text
+                        )
+
+            ctx.close()
+            browser.close()
+    return {"status": "ok"}
