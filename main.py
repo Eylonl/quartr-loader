@@ -16,7 +16,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Quartr Loader", version="1.6 (Keycloak login)")
+app = FastAPI(title="Quartr Loader", version="1.7 (Keycloak robust)")
 
 
 # ------------------------------
@@ -67,13 +67,13 @@ def upsert_row(sb, **row):
 
 
 # ------------------------------
-# Keycloak login flow
+# Keycloak login flow (robust)
 # ------------------------------
 def login_keycloak(page, email: str, password: str):
     """
     Logs in via Quartr's Keycloak page.
-    Uses QUARTR_LOGIN_URL if set; otherwise tries your provided URL first,
-    then falls back to letting web.quartr.com redirect to the current auth URL.
+    Tries explicit QUARTR_LOGIN_URL (or provided URL), then falls back by letting
+    web.quartr.com redirect to the active Keycloak URL. Handles iframes and late render.
     """
     provided_url = (
         "https://auth.quartr.com/realms/prod/protocol/openid-connect/auth"
@@ -84,87 +84,167 @@ def login_keycloak(page, email: str, password: str):
     )
     login_url = os.getenv("QUARTR_LOGIN_URL") or provided_url
 
-    def _try_login_at(url: str) -> bool:
-        page.set_default_timeout(45000)
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
+    page.set_default_timeout(50000)
 
-        # Dismiss cookie banners if any
+    def _dismiss_cookies(doc):
         try:
             for txt in ["Accept", "Agree", "Allow all", "OK", "I agree"]:
-                btn = page.get_by_role("button", name=txt, exact=False)
+                btn = doc.get_by_role("button", name=txt, exact=False)
                 if btn and btn.count():
                     btn.first.click()
-                    page.wait_for_timeout(250)
+                    doc.wait_for_timeout(300)
                     break
         except Exception:
             pass
 
-        # Typical Keycloak input names/ids; include robust fallbacks
-        user_candidates = [
+    def _fill_on(doc) -> bool:
+        """Try to fill on a given document context (page or frame)."""
+        try:
+            doc.wait_for_selector("input, button[type='submit'], #kc-login", timeout=15000)
+        except Exception:
+            return False
+
+        # Some Keycloak themes show an intermediate “Continue with email/password” step
+        try:
+            for txt in ["Continue with Email", "Continue", "Sign in with email", "Email"]:
+                b = doc.get_by_role("button", name=txt, exact=False)
+                if b and b.count():
+                    b.first.click()
+                    doc.wait_for_timeout(400)
+        except Exception:
+            pass
+
+        user_sel = [
             "#username", "input[name='username']",
             "input[type='email']", "input[placeholder*='email' i]",
             "input[placeholder*='username' i]",
         ]
-        pass_candidates = [
+        pass_sel = [
             "#password", "input[name='password']",
             "input[type='password']", "input[placeholder*='password' i]",
         ]
 
-        def fill_one(cands, value) -> bool:
-            for sel in cands:
-                loc = page.locator(sel)
-                if loc and loc.count():
-                    loc.first.fill(value)
-                    return True
+        # Username/email
+        for sel in user_sel:
+            loc = doc.locator(sel)
+            if loc and loc.count():
+                try:
+                    loc.first.fill(email)
+                    break
+                except Exception:
+                    pass
+        else:
             for loc in (
-                page.get_by_label("Email", exact=False),
-                page.get_by_label("Username", exact=False),
-                page.get_by_placeholder("Email"),
-                page.get_by_placeholder("Username"),
-                page.get_by_role("textbox", name="Email", exact=False),
+                doc.get_by_label("Email", exact=False),
+                doc.get_by_label("Username", exact=False),
+                doc.get_by_placeholder("Email"),
+                doc.get_by_placeholder("Username"),
+                doc.get_by_role("textbox", name="Email", exact=False),
             ):
                 if loc and loc.count():
-                    loc.first.fill(value)
-                    return True
-            return False
+                    try:
+                        loc.first.fill(email)
+                        break
+                    except Exception:
+                        pass
+            else:
+                return False
 
-        if not fill_one(user_candidates, email):
-            return False
-        if not fill_one(pass_candidates, password):
-            return False
+        # Password
+        for sel in pass_sel:
+            loc = doc.locator(sel)
+            if loc and loc.count():
+                try:
+                    loc.first.fill(password)
+                    break
+                except Exception:
+                    pass
+        else:
+            for loc in (
+                doc.get_by_label("Password", exact=False),
+                doc.get_by_placeholder("Password"),
+                doc.get_by_role("textbox", name="Password", exact=False),
+            ):
+                if loc and loc.count():
+                    try:
+                        loc.first.fill(password)
+                        break
+                    except Exception:
+                        pass
+            else:
+                return False
 
         # Submit
-        submitted = False
         for btn in (
-            page.get_by_role("button", name="Sign in", exact=False),
-            page.get_by_role("button", name="Log in", exact=False),
-            page.locator("input[type='submit']"),
-            page.locator("button[type='submit']"),
+            doc.locator("#kc-login"),
+            doc.get_by_role("button", name="Sign in", exact=False),
+            doc.get_by_role("button", name="Log in", exact=False),
+            doc.locator("button[type='submit']"),
+            doc.locator("input[type='submit']"),
         ):
             if btn and btn.count():
-                btn.first.click()
-                submitted = True
-                break
-        if not submitted:
-            page.keyboard.press("Enter")
+                try:
+                    # Some Keycloak themes navigate fully, others SPA-transition
+                    with doc.expect_navigation(wait_until="load", timeout=20000):
+                        btn.first.click()
+                except Exception:
+                    btn.first.click()
+                doc.wait_for_load_state("networkidle")
+                doc.wait_for_timeout(800)
+                return True
 
-        # Wait for redirect back to web.quartr.com
+        # Fallback: Enter key
+        try:
+            doc.keyboard.press("Enter")
+            doc.wait_for_load_state("networkidle")
+            doc.wait_for_timeout(800)
+            return True
+        except Exception:
+            return False
+
+    def _attempt(url: str) -> bool:
+        page.goto(url, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+        _dismiss_cookies(page)
 
-        # Heuristic: ensure we’re on web.quartr.com now (or already logged in)
+        # Try on the main page
+        if _fill_on(page):
+            if "web.quartr.com" in page.url:
+                return True
+
+        # Try any iframes (Keycloak can render in an inner frame)
+        try:
+            for fr in page.frames:
+                if fr == page.main_frame:
+                    continue
+                _dismiss_cookies(fr)
+                if _fill_on(fr):
+                    if "web.quartr.com" in page.url:
+                        return True
+        except Exception:
+            pass
+
+        if "auth.quartr.com" in page.url:
+            page.wait_for_timeout(2000)
         return "web.quartr.com" in page.url
 
-    # 1) Try provided/explicit Keycloak URL
-    if _try_login_at(login_url):
+    # 1) Try explicit URL
+    if _attempt(login_url):
         return
 
-    # 2) Fallback: let the app redirect us to the active Keycloak URL
+    # 2) Let app push us to active auth URL then attempt there
     page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    if _try_login_at(page.url):  # page.url should now be the live Keycloak URL
+    if _attempt(page.url):
         return
+
+    # Debug screenshot
+    try:
+        snap = f"/tmp/keycloak_fail_{int(time.time())}.png"
+        page.screenshot(path=snap, full_page=True)
+        logger.error("Keycloak login failed. Screenshot saved: %s", snap)
+    except Exception:
+        pass
 
     raise RuntimeError(f"Keycloak login failed; final URL: {page.url}")
 
@@ -175,7 +255,6 @@ def login_keycloak(page, email: str, password: str):
 def open_home(page):
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    # best-effort cookie banner dismiss
     try:
         btn = page.get_by_role("button", name="Accept", exact=False)
         if btn and btn.count():
@@ -187,7 +266,6 @@ def open_home(page):
 
 def open_company(page, ticker: str):
     """Search for ticker from the app header search."""
-    # Try multiple search entry points
     candidates = [
         page.get_by_placeholder("Search"),
         page.get_by_role("combobox", name="Search", exact=False),
@@ -202,7 +280,6 @@ def open_company(page, ticker: str):
                 page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(1200)
-                # click the first matching result
                 res = page.get_by_text(ticker.upper(), exact=False)
                 if res and res.count():
                     res.first.click()
@@ -280,10 +357,11 @@ def diag():
 
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
+    # Validate env first
     try:
         email = require_env("QUARTR_EMAIL")
         password = require_env("QUARTR_PASSWORD")
-        sb = supabase_client_server()  # validates SB env
+        sb = supabase_client_server()
         bucket = bucket_name()
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"Config error: {e}")
@@ -291,7 +369,12 @@ def backfill(req: BackfillRequest):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             ctx = browser.new_context(
                 accept_downloads=True,
@@ -308,7 +391,6 @@ def backfill(req: BackfillRequest):
             # Land on home to ensure SPA has loaded
             open_home(page)
 
-            # What to pull
             LABELS = [
                 ("Transcript", "transcript"),
                 ("Press Release", "press_release"),
@@ -374,6 +456,7 @@ def backfill(req: BackfillRequest):
             ctx.close()
             browser.close()
         return {"status": "ok"}
+
     except Exception as e:
         logger.error("Backfill failed: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Unhandled error: {e}")
