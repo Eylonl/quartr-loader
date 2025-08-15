@@ -1,11 +1,8 @@
 import os
-import io
-import json
-import base64
 import time
 import logging
 import traceback
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -19,7 +16,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Quartr Loader", version="1.4 (uses saved session)")
+app = FastAPI(title="Quartr Loader", version="1.6 (Keycloak login)")
 
 
 # ------------------------------
@@ -40,32 +37,6 @@ def supabase_client_server():
 
 def bucket_name() -> str:
     return os.getenv("SUPABASE_BUCKET", "earnings")
-
-
-def load_storage_state_to_file() -> Optional[str]:
-    """
-    If QUARTR_STORAGE_STATE is set (raw JSON or base64 of JSON),
-    write it to /app/quartr_state.json and return that path.
-    """
-    state_env = os.getenv("QUARTR_STORAGE_STATE", "").strip()
-    if not state_env:
-        return None
-    try:
-        # Try base64 first
-        try:
-            decoded = base64.b64decode(state_env).decode("utf-8")
-            data = json.loads(decoded)
-        except Exception:
-            # Fallback: assume raw JSON string
-            data = json.loads(state_env)
-        path = "/app/quartr_state.json"
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        logger.info("Loaded storage_state into %s", path)
-        return path
-    except Exception as e:
-        logger.error("Failed to parse QUARTR_STORAGE_STATE: %s", e)
-        return None
 
 
 # ------------------------------
@@ -96,124 +67,110 @@ def upsert_row(sb, **row):
 
 
 # ------------------------------
-# Login (fallback) — only used if storage_state is missing/invalid
+# Keycloak login flow
 # ------------------------------
-def login_with_credentials(page, email: str, password: str):
-    login_urls = [
-        os.getenv("QUARTR_LOGIN_URL") or "https://app.quartr.com/login",
-        "https://quartr.com/login",
-        "https://app.quartr.com/sign-in",
-    ]
+def login_keycloak(page, email: str, password: str):
+    """
+    Logs in via Quartr's Keycloak page.
+    Uses QUARTR_LOGIN_URL if set; otherwise tries your provided URL first,
+    then falls back to letting web.quartr.com redirect to the current auth URL.
+    """
+    provided_url = (
+        "https://auth.quartr.com/realms/prod/protocol/openid-connect/auth"
+        "?response_type=code&client_id=web"
+        "&redirect_uri=https%3A%2F%2Fweb.quartr.com%2Fapi%2Fauth%2Fcallback%2Fkeycloak"
+        "&code_challenge=1pq9sKtxWv6EouXakPlyEFXYbuV9sKIkzaGL26g9ss8"
+        "&code_challenge_method=S256&scope=openid+profile+email"
+    )
+    login_url = os.getenv("QUARTR_LOGIN_URL") or provided_url
 
-    page.set_default_timeout(45000)  # assume default 30s otherwise
+    def _try_login_at(url: str) -> bool:
+        page.set_default_timeout(45000)
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
 
-    def _dismiss_cookies(p):
+        # Dismiss cookie banners if any
         try:
-            for text in ["Accept", "I agree", "Agree", "Accept all", "Allow all"]:
-                btn = p.get_by_role("button", name=text, exact=False)
+            for txt in ["Accept", "Agree", "Allow all", "OK", "I agree"]:
+                btn = page.get_by_role("button", name=txt, exact=False)
                 if btn and btn.count():
                     btn.first.click()
-                    p.wait_for_timeout(500)
+                    page.wait_for_timeout(250)
                     break
         except Exception:
             pass
 
-    def _fill_in_login_on(p) -> bool:
-        selectors_email = [
-            "input[placeholder*='email' i]",
-            "input[type='email']",
-            "input[name*='email' i]",
+        # Typical Keycloak input names/ids; include robust fallbacks
+        user_candidates = [
+            "#username", "input[name='username']",
+            "input[type='email']", "input[placeholder*='email' i]",
+            "input[placeholder*='username' i]",
         ]
-        selectors_pass = [
-            "input[placeholder*='password' i]",
-            "input[type='password']",
-            "input[name*='password' i]",
-        ]
-        candidates_email = [
-            p.get_by_placeholder("Email"),
-            p.get_by_label("Email", exact=False),
-            p.get_by_role("textbox", name="Email", exact=False),
-        ]
-        candidates_pass = [
-            p.get_by_placeholder("Password"),
-            p.get_by_label("Password", exact=False),
-            p.get_by_role("textbox", name="Password", exact=False),
+        pass_candidates = [
+            "#password", "input[name='password']",
+            "input[type='password']", "input[placeholder*='password' i]",
         ]
 
-        # email
-        for sel in selectors_email:
-            loc = p.locator(sel)
-            if loc.count():
-                loc.first.fill(email)
-                break
-        else:
-            for loc in candidates_email:
+        def fill_one(cands, value) -> bool:
+            for sel in cands:
+                loc = page.locator(sel)
                 if loc and loc.count():
-                    loc.first.fill(email)
-                    break
-            else:
-                return False
-
-        # password
-        for sel in selectors_pass:
-            loc = p.locator(sel)
-            if loc.count():
-                loc.first.fill(password)
-                break
-        else:
-            for loc in candidates_pass:
+                    loc.first.fill(value)
+                    return True
+            for loc in (
+                page.get_by_label("Email", exact=False),
+                page.get_by_label("Username", exact=False),
+                page.get_by_placeholder("Email"),
+                page.get_by_placeholder("Username"),
+                page.get_by_role("textbox", name="Email", exact=False),
+            ):
                 if loc and loc.count():
-                    loc.first.fill(password)
-                    break
-            else:
-                return False
-
-        # submit
-        buttons = [
-            p.get_by_role("button", name="Log in", exact=False),
-            p.get_by_role("button", name="Sign in", exact=False),
-            p.get_by_role("button", name="Sign In", exact=False),
-            p.locator("button[type='submit']"),
-            p.locator("input[type='submit']"),
-        ]
-        for b in buttons:
-            if b and b.count():
-                b.first.click()
-                p.wait_for_load_state("networkidle")
-                return True
-
-        try:
-            p.keyboard.press("Enter")
-            p.wait_for_load_state("networkidle")
-            return True
-        except Exception:
+                    loc.first.fill(value)
+                    return True
             return False
 
-    last_err = None
-    for url in login_urls:
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_load_state("networkidle")
-            _dismiss_cookies(page)
-            if _fill_in_login_on(page):
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(800)
-                return
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+        if not fill_one(user_candidates, email):
+            return False
+        if not fill_one(pass_candidates, password):
+            return False
 
-    try:
-        path = f"/tmp/login_failure_{int(time.time())}.png"
-        page.screenshot(path=path, full_page=True)
-        logger.error("Login failed. Screenshot: %s", path)
-    except Exception:
-        pass
+        # Submit
+        submitted = False
+        for btn in (
+            page.get_by_role("button", name="Sign in", exact=False),
+            page.get_by_role("button", name="Log in", exact=False),
+            page.locator("input[type='submit']"),
+            page.locator("button[type='submit']"),
+        ):
+            if btn and btn.count():
+                btn.first.click()
+                submitted = True
+                break
+        if not submitted:
+            page.keyboard.press("Enter")
 
-    raise RuntimeError(f"Login fallback failed. Last error: {last_err or 'unknown'}")
+        # Wait for redirect back to web.quartr.com
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(800)
+
+        # Heuristic: ensure we’re on web.quartr.com now (or already logged in)
+        return "web.quartr.com" in page.url
+
+    # 1) Try provided/explicit Keycloak URL
+    if _try_login_at(login_url):
+        return
+
+    # 2) Fallback: let the app redirect us to the active Keycloak URL
+    page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    if _try_login_at(page.url):  # page.url should now be the live Keycloak URL
+        return
+
+    raise RuntimeError(f"Keycloak login failed; final URL: {page.url}")
 
 
 # ------------------------------
-# Quartr navigation helpers
+# Quartr app navigation
 # ------------------------------
 def open_home(page):
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
@@ -229,10 +186,8 @@ def open_home(page):
 
 
 def open_company(page, ticker: str):
-    """
-    Search for ticker from the web.quartr.com app header search.
-    """
-    # Try a few common search entry points
+    """Search for ticker from the app header search."""
+    # Try multiple search entry points
     candidates = [
         page.get_by_placeholder("Search"),
         page.get_by_role("combobox", name="Search", exact=False),
@@ -284,7 +239,7 @@ def download_label(page, label_text: str) -> Tuple[Optional[bytes], Optional[str
 
 
 # ------------------------------
-# Models & Routes
+# API models & routes
 # ------------------------------
 class BackfillRequest(BaseModel):
     ticker: str
@@ -308,7 +263,6 @@ def envcheck():
         "SUPABASE_URL": present("SUPABASE_URL"),
         "SUPABASE_SERVICE_ROLE_KEY": present("SUPABASE_SERVICE_ROLE_KEY"),
         "SUPABASE_BUCKET": os.getenv("SUPABASE_BUCKET", "earnings"),
-        "QUARTR_STORAGE_STATE": present("QUARTR_STORAGE_STATE"),
     }
 
 
@@ -327,50 +281,34 @@ def diag():
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
     try:
+        email = require_env("QUARTR_EMAIL")
+        password = require_env("QUARTR_PASSWORD")
         sb = supabase_client_server()  # validates SB env
         bucket = bucket_name()
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"Config error: {e}")
-
-    storage_state_path = load_storage_state_to_file()
-    use_saved_session = storage_state_path is not None
-
-    # If no saved session provided, we can optionally fall back to credentials
-    email = os.getenv("QUARTR_EMAIL")
-    password = os.getenv("QUARTR_PASSWORD")
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
-            ctx_kwargs = dict(accept_downloads=True,
-                              user_agent=("Mozilla/5.0 (X11; Linux x86_64) "
-                                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                          "Chrome/124.0 Safari/537.36"),
-                              viewport={"width": 1366, "height": 900},
-                              locale="en-US")
-            if use_saved_session:
-                ctx_kwargs["storage_state"] = storage_state_path
-            ctx = browser.new_context(**ctx_kwargs)
+            ctx = browser.new_context(
+                accept_downloads=True,
+                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                viewport={"width": 1366, "height": 900},
+                locale="en-US",
+            )
             page = ctx.new_page()
 
-            # Start at /home to leverage existing session
+            # Login via Keycloak
+            login_keycloak(page, email, password)
+
+            # Land on home to ensure SPA has loaded
             open_home(page)
 
-            # If we still see a login form, fall back (only if creds exist)
-            try:
-                # Heuristic: look for "Log in" button visible on the page
-                needs_login = False
-                btn = page.get_by_role("button", name="Log in", exact=False)
-                if btn and btn.count():
-                    needs_login = True
-                if needs_login and email and password:
-                    login_with_credentials(page, email, password)
-            except Exception:
-                pass
-
-            # ---- Actual collection flow ----
+            # What to pull
             LABELS = [
                 ("Transcript", "transcript"),
                 ("Press Release", "press_release"),
@@ -380,6 +318,7 @@ def backfill(req: BackfillRequest):
             def qn(q: str) -> int:
                 return int(q.replace("Q", ""))
 
+            # Navigate to ticker and iterate quarters
             open_company(page, req.ticker)
 
             for year in range(req.start_year, req.end_year + 1):
@@ -438,11 +377,3 @@ def backfill(req: BackfillRequest):
     except Exception as e:
         logger.error("Backfill failed: %s\n%s", e, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Unhandled error: {e}")
-
-
-# ------------------------------
-# (Optional) endpoint to read back the storage_state presence
-# ------------------------------
-@app.get("/statecheck")
-def statecheck():
-    return {"storage_state_exists": os.path.exists("/app/quartr_state.json")}
