@@ -5,6 +5,7 @@ import traceback
 from typing import Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -16,7 +17,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Quartr Loader", version="1.7 (Keycloak robust)")
+app = FastAPI(title="Quartr Loader", version="1.8 (debug screenshots)")
 
 
 # ------------------------------
@@ -67,6 +68,30 @@ def upsert_row(sb, **row):
 
 
 # ------------------------------
+# Debug screenshot helpers & endpoint
+# ------------------------------
+def save_debug_shot(page, tag: str) -> str:
+    """Save a full-page PNG into /tmp and return the filename."""
+    fname = f"debug_{tag}_{int(time.time())}.png"
+    path = f"/tmp/{fname}"
+    try:
+        page.screenshot(path=path, full_page=True)
+        logger.error("Saved debug screenshot: %s", path)
+    except Exception as e:
+        logger.error("Failed to save debug screenshot: %s", e)
+    return fname
+
+@app.get("/debug/snap/{fname}")
+def debug_snap(fname: str):
+    # Only allow /tmp files we created
+    safe = os.path.basename(fname)
+    path = f"/tmp/{safe}"
+    if not os.path.exists(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path, media_type="image/png")
+
+
+# ------------------------------
 # Keycloak login flow (robust)
 # ------------------------------
 def login_keycloak(page, email: str, password: str):
@@ -104,7 +129,7 @@ def login_keycloak(page, email: str, password: str):
         except Exception:
             return False
 
-        # Some Keycloak themes show an intermediate “Continue with email/password” step
+        # Some Keycloak themes show an intermediate step
         try:
             for txt in ["Continue with Email", "Continue", "Sign in with email", "Email"]:
                 b = doc.get_by_role("button", name=txt, exact=False)
@@ -212,7 +237,7 @@ def login_keycloak(page, email: str, password: str):
             if "web.quartr.com" in page.url:
                 return True
 
-        # Try any iframes (Keycloak can render in an inner frame)
+        # Try any iframes
         try:
             for fr in page.frames:
                 if fr == page.main_frame:
@@ -238,15 +263,8 @@ def login_keycloak(page, email: str, password: str):
     if _attempt(page.url):
         return
 
-    # Debug screenshot
-    try:
-        snap = f"/tmp/keycloak_fail_{int(time.time())}.png"
-        page.screenshot(path=snap, full_page=True)
-        logger.error("Keycloak login failed. Screenshot saved: %s", snap)
-    except Exception:
-        pass
-
-    raise RuntimeError(f"Keycloak login failed; final URL: {page.url}")
+    snap = save_debug_shot(page, "keycloak_fail")
+    raise RuntimeError(f"Keycloak login failed; final URL: {page.url}. Screenshot: /debug/snap/{snap}")
 
 
 # ------------------------------
@@ -272,6 +290,7 @@ def open_company(page, ticker: str):
       2) Keyboard "/" to focus search then Enter
       3) Direct search page fallback: /search?q=<TICKER>
     Then clicks the first result that mentions the ticker.
+    If all fail, saves a screenshot and raises.
     """
     t = ticker.upper()
 
@@ -293,7 +312,6 @@ def open_company(page, ticker: str):
         generic = ctx.get_by_text(t, exact=False)
         if generic and generic.count():
             try:
-                # If it's not a link, click the closest clickable parent
                 el = generic.first
                 try:
                     el.click()
@@ -305,10 +323,11 @@ def open_company(page, ticker: str):
                 pass
         return False
 
-    # Strategy 0: ensure we’re in the app
+    # Always start from home
     try:
         page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(600)
     except Exception:
         pass
 
@@ -356,7 +375,8 @@ def open_company(page, ticker: str):
     except Exception:
         pass
 
-    raise RuntimeError("Could not open company from search UI.")
+    snap = save_debug_shot(page, f"open_company_fail_{t}")
+    raise RuntimeError(f"Could not open company from search UI. Screenshot: /debug/snap/{snap}")
 
 
 def open_quarter(page, year: int, quarter: str) -> bool:
@@ -424,6 +444,17 @@ def diag():
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/debug/ping")
+def debug_ping():
+    return {"ok": True}
+
+
+@app.get("/debug/list_tmp")
+def debug_list_tmp():
+    files = [f for f in os.listdir("/tmp") if f.endswith(".png")]
+    return {"files": files}
+
+
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
     # Validate env first
@@ -457,8 +488,9 @@ def backfill(req: BackfillRequest):
             # Login via Keycloak
             login_keycloak(page, email, password)
 
-            # Land on home to ensure SPA has loaded
+            # Land on home to ensure SPA has loaded; take a debug shot
             open_home(page)
+            save_debug_shot(page, "after_login_home")
 
             LABELS = [
                 ("Transcript", "transcript"),
@@ -478,6 +510,8 @@ def backfill(req: BackfillRequest):
                 for qi in range(q_start, q_end + 1):
                     q = f"Q{qi}"
                     if not open_quarter(page, year, q):
+                        # save where it failed to select the quarter
+                        save_debug_shot(page, f"open_quarter_fail_{req.ticker}_{year}_{q}")
                         logger.warning("Quarter not found: %s %s %s", req.ticker, year, q)
                         continue
 
@@ -528,4 +562,5 @@ def backfill(req: BackfillRequest):
 
     except Exception as e:
         logger.error("Backfill failed: %s\n%s", e, traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Unhandled error: {e}")
+        detail = str(e)
+        raise HTTPException(status_code=500, detail=f"Unhandled error: {detail}")
