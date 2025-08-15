@@ -1,4 +1,6 @@
 import os
+import logging
+import traceback
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -7,7 +9,8 @@ import fitz  # PyMuPDF
 
 load_dotenv()
 
-app = FastAPI(title="Quartr Loader", version="1.1")
+app = FastAPI(title="Quartr Loader", version="1.2")
+logger = logging.getLogger("uvicorn.error")
 
 # ---------- Env helpers ----------
 def get_env(name: str, required: bool = True, default: str | None = None) -> str | None:
@@ -17,6 +20,7 @@ def get_env(name: str, required: bool = True, default: str | None = None) -> str
     return val
 
 def supabase_client_server():
+    # Lazy-create client so app still boots even if env is misconfigured.
     from supabase import create_client
     url = get_env("SUPABASE_URL")
     key = get_env("SUPABASE_SERVICE_ROLE_KEY")
@@ -39,7 +43,7 @@ def file_exists(storage_path: str) -> bool:
     parent, name = storage_path.rsplit("/", 1)
     try:
         entries = SB.storage.from_(BUCKET).list(path=parent)
-        return any(e.get("name") == name for e in entries)
+        return any(e.get("name") == name for e in (entries or []))
     except Exception:
         return False
 
@@ -88,11 +92,35 @@ def download_label(page, label_text: str):
     except PWTimeoutError:
         return None, None
 
-# ---------- API ----------
+# ---------- Health & diagnostics ----------
 @app.get("/health")
 def health():
     return {"ok": True}
 
+@app.get("/envcheck")
+def envcheck():
+    present = lambda k: bool(os.getenv(k))
+    return {
+        # booleans only; no secrets are returned
+        "QUARTR_EMAIL": present("QUARTR_EMAIL"),
+        "QUARTR_PASSWORD": present("QUARTR_PASSWORD"),
+        "SUPABASE_URL": present("SUPABASE_URL"),
+        "SUPABASE_SERVICE_ROLE_KEY": present("SUPABASE_SERVICE_ROLE_KEY"),
+        "SUPABASE_BUCKET": os.getenv("SUPABASE_BUCKET", "earnings"),
+    }
+
+@app.get("/diag")
+def diag():
+    try:
+        SB = supabase_client_server()
+        bucket = bucket_name()
+        entries = SB.storage.from_(bucket).list()  # list root
+        return {"ok": True, "bucket": bucket, "entries": len(entries or [])}
+    except Exception as e:
+        logger.error("Diag failed: %s\n%s", e, traceback.format_exc())
+        return {"ok": False, "error": str(e)}
+
+# ---------- API ----------
 class BackfillRequest(BaseModel):
     ticker: str
     start_year: int
@@ -103,41 +131,47 @@ class BackfillRequest(BaseModel):
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
     try:
+        # Validate required env upfront (but don't crash the server)
         email = get_env("QUARTR_EMAIL")
         password = get_env("QUARTR_PASSWORD")
-        _ = supabase_client_server()  # validates SUPABASE_URL + SERVICE_ROLE
+        SB = supabase_client_server()  # ensures SUPABASE_URL + SERVICE_ROLE are set/valid
         BUCKET = bucket_name()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-    def qn(q): return int(q.replace("Q",""))
-    headless = True
-    args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        def qn(q): return int(q.replace("Q", ""))
+        headless = True
+        args = ["--no-sandbox", "--disable-dev-shm-usage"]
 
-    SB = supabase_client_server()
+        LABELS = [
+            ("Transcript", "transcript"),
+            ("Press Release", "press_release"),
+            ("Presentation", "presentation"),
+        ]
 
-    with sync_playwright() as p:
+        with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless, args=args)
             ctx = browser.new_context(accept_downloads=True)
             page = ctx.new_page()
+
+            # Login + navigate
             login(page, email, password)
-
-            LABELS = [("Transcript","transcript"),("Press Release","press_release"),("Presentation","presentation")]
-
             open_company(page, req.ticker)
+
             for year in range(req.start_year, req.end_year + 1):
                 q_start = qn(req.start_q) if year == req.start_year else 1
                 q_end = qn(req.end_q) if year == req.end_year else 4
                 for qi in range(q_start, q_end + 1):
                     q = f"Q{qi}"
                     if not open_quarter(page, year, q):
+                        logger.warning("Quarter not found: %s %s %s", req.ticker, year, q)
                         continue
                     for label, ftype in LABELS:
                         key = path_for(req.ticker, year, q, ftype)
                         if file_exists(key):
+                            logger.info("Skip existing: %s", key)
                             continue
                         b, url = download_label(page, label)
                         if not b:
+                            logger.info("No %s for %s %s %s", ftype, req.ticker, year, q)
                             continue
                         SB.storage.from_(BUCKET).upload(
                             key, b, {"content-type": "application/pdf", "upsert": True}
@@ -156,4 +190,11 @@ def backfill(req: BackfillRequest):
 
             ctx.close()
             browser.close()
-    return {"status": "ok"}
+        return {"status": "ok"}
+
+    except RuntimeError as e:
+        logger.error("Config error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Config error: {e}")
+    except Exception as e:
+        logger.error("Backfill failed: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Unhandled error: {e}")
