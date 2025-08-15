@@ -265,28 +265,97 @@ def open_home(page):
 
 
 def open_company(page, ticker: str):
-    """Search for ticker from the app header search."""
-    candidates = [
+    """
+    Robustly open a company page given a ticker.
+    Tries:
+      1) Header search (several selectors)
+      2) Keyboard "/" to focus search then Enter
+      3) Direct search page fallback: /search?q=<TICKER>
+    Then clicks the first result that mentions the ticker.
+    """
+    t = ticker.upper()
+
+    def _click_first_match(ctx) -> bool:
+        # Try links first (best signal)
+        for loc in (
+            ctx.get_by_role("link", name=t, exact=False),
+            ctx.locator(f"a:has-text('{t}')"),
+        ):
+            if loc and loc.count():
+                try:
+                    loc.first.click()
+                    ctx.wait_for_load_state("networkidle")
+                    return True
+                except Exception:
+                    pass
+
+        # Then any element naming the ticker (cards/tiles)
+        generic = ctx.get_by_text(t, exact=False)
+        if generic and generic.count():
+            try:
+                # If it's not a link, click the closest clickable parent
+                el = generic.first
+                try:
+                    el.click()
+                except Exception:
+                    el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
+                ctx.wait_for_load_state("networkidle")
+                return True
+            except Exception:
+                pass
+        return False
+
+    # Strategy 0: ensure we’re in the app
+    try:
+        page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+    except Exception:
+        pass
+
+    # Strategy 1: header search field(s)
+    search_boxes = [
         page.get_by_placeholder("Search"),
         page.get_by_role("combobox", name="Search", exact=False),
         page.locator("input[type='search']"),
         page.locator("input[placeholder*='Search' i]"),
+        page.locator("input[aria-label*='Search' i]"),
     ]
-    for loc in candidates:
+    for sb in search_boxes:
         try:
-            if loc and loc.count():
-                loc.first.click()
-                loc.first.fill(ticker)
+            if sb and sb.count():
+                sb.first.click()
+                sb.first.fill(t)
                 page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(1200)
-                res = page.get_by_text(ticker.upper(), exact=False)
-                if res and res.count():
-                    res.first.click()
-                    page.wait_for_load_state("networkidle")
+                if _click_first_match(page):
                     return
         except Exception:
             continue
+
+    # Strategy 2: try focusing search via "/" hotkey then enter
+    try:
+        page.keyboard.press("/")
+        page.wait_for_timeout(200)
+        page.keyboard.type(t)
+        page.keyboard.press("Enter")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1200)
+        if _click_first_match(page):
+            return
+    except Exception:
+        pass
+
+    # Strategy 3: direct search page (common SPA route)
+    try:
+        page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1200)
+        if _click_first_match(page):
+            return
+    except Exception:
+        pass
+
     raise RuntimeError("Could not open company from search UI.")
 
 
