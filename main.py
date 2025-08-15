@@ -1,390 +1,221 @@
 import os
 import time
 import logging
-import traceback
-from typing import Optional, Tuple
-
+from typing import Optional
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
-
-# Optional: comment these out if you’re not using Supabase in this service yet
-from supabase import create_client
+from playwright.sync_api import sync_playwright
+import httpx
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Quartr Loader", version="2.0 (envcheck + debug + 2-step login)")
+app = FastAPI()
 
+# Environment variables
+QUARTR_EMAIL = os.getenv("QUARTR_EMAIL")
+QUARTR_PASSWORD = os.getenv("QUARTR_PASSWORD")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "earnings")
 
-# ------------------------------
-# Env / Supabase helpers
-# ------------------------------
-def require_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val
-
-
-def supabase_client_server():
-    # Only used by /diag (safe no-op if you haven’t created table/bucket yet)
-    url = require_env("SUPABASE_URL")
-    key = require_env("SUPABASE_SERVICE_ROLE_KEY")
-    return create_client(url, key)
+if not QUARTR_EMAIL or not QUARTR_PASSWORD or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    logger.warning("Missing one or more required environment variables.")
 
 
-def bucket_name() -> str:
-    return os.getenv("SUPABASE_BUCKET", "earnings")
+# ------------------ Debug helpers ------------------
 
-
-# ------------------------------
-# Debug helpers & endpoints
-# ------------------------------
 def _save_png(page, tag: str) -> str:
+    """Save a full-page PNG to /tmp and log a direct URL you can click."""
     fname = f"debug_{tag}_{int(time.time())}.png"
     path = f"/tmp/{fname}"
     try:
         page.screenshot(path=path, full_page=True)
-        logger.error("Saved debug PNG: %s", path)
+        logger.error("Saved debug PNG: %s", f"/debug/snap/{fname}")
     except Exception as e:
         logger.error("Failed to save PNG: %s", e)
     return fname
 
 
 def _save_html(page, tag: str) -> str:
+    """Save current HTML to /tmp and log a direct URL you can click."""
     fname = f"debug_{tag}_{int(time.time())}.html"
     path = f"/tmp/{fname}"
     try:
         html = page.content()
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
-        logger.error("Saved debug HTML: %s", path)
+        logger.error("Saved debug HTML: %s", f"/debug/html/{fname}")
     except Exception as e:
         logger.error("Failed to save HTML: %s", e)
     return fname
 
 
-@app.get("/debug/snap/{fname}")
-def debug_snap(fname: str):
-    safe = os.path.basename(fname)
-    path = f"/tmp/{safe}"
-    if not os.path.exists(path):
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return FileResponse(path, media_type="image/png")
+# ------------------ Quartr login ------------------
 
+def login_keycloak(page, email, password):
+    """Log in to Quartr via Keycloak."""
+    page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
+    page.wait_for_timeout(500)
 
-@app.get("/debug/html/{fname}")
-def debug_html(fname: str):
-    safe = os.path.basename(fname)
-    path = f"/tmp/{safe}"
-    if not os.path.exists(path):
-        return JSONResponse({"error": "not found"}, status_code=404)
-    with open(path, "r", encoding="utf-8") as f:
-        return PlainTextResponse(f.read(), media_type="text/html")
-
-
-@app.get("/debug/list_tmp")
-def debug_list_tmp():
-    files = [f for f in os.listdir("/tmp") if f.endswith(".png") or f.endswith(".html")]
-    return {"files": files}
-
-
-# ------------------------------
-# Keycloak login (robust 2-step)
-# ------------------------------
-def login_keycloak(page, email: str, password: str):
-    """
-    Step 1: enter email -> Next/Continue (or Enter)
-    Step 2: enter password (if shown) -> Log in/Sign in (or Enter)
-    Works on main page and iframes. Dumps screenshot+HTML on failure.
-    """
-    page.set_default_timeout(60000)
-
-    def _dismiss_cookies(doc):
-        try:
-            for txt in ["Accept", "Agree", "Allow all", "OK", "I agree", "Accept all cookies"]:
-                btn = doc.get_by_role("button", name=txt, exact=False)
-                if btn and btn.count():
-                    btn.first.click()
-                    doc.wait_for_timeout(250)
-                    break
-        except Exception:
-            pass
-
-    def _press_submit(doc) -> bool:
-        buttons = [
-            "#kc-login", "button#kc-login", "button[name='login']",
-            "button[type='submit']", "input[type='submit']",
-        ]
-        text_buttons = [
-            "Next", "Continue", "Continue with Email",
-            "Sign in", "Sign In", "Log in", "Log In",
-            "Proceed",
-        ]
-        for sel in buttons:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    with doc.expect_navigation(wait_until="load", timeout=20000):
-                        loc.first.click()
-                except Exception:
-                    loc.first.click()
-                doc.wait_for_load_state("networkidle")
-                doc.wait_for_timeout(400)
-                return True
-        for txt in text_buttons:
-            loc = doc.get_by_role("button", name=txt, exact=False)
-            if loc and loc.count():
-                try:
-                    with doc.expect_navigation(wait_until="load", timeout=20000):
-                        loc.first.click()
-                except Exception:
-                    loc.first.click()
-                doc.wait_for_load_state("networkidle")
-                doc.wait_for_timeout(400)
-                return True
-        try:
-            doc.keyboard.press("Enter")
-            doc.wait_for_load_state("networkidle")
-            doc.wait_for_timeout(300)
-            return True
-        except Exception:
-            return False
-
-    def _fill_email_then_submit(doc) -> bool:
-        _dismiss_cookies(doc)
-        # Some themes require clicking an intermediate "Continue with Email"
-        try:
-            for txt in ["Continue with Email", "Continue", "Sign in with email", "Email"]:
-                b = doc.get_by_role("button", name=txt, exact=False)
-                if b and b.count():
-                    b.first.click()
-                    doc.wait_for_timeout(300)
-                    break
-        except Exception:
-            pass
-
-        email_sels = [
-            "#username", "input#email",
-            "input[name='username']", "input[name='email']",
-            "input[type='email']", "input[autocomplete='username']",
-            "input[placeholder*='email' i]", "input[placeholder*='username' i]",
-        ]
-        filled = False
-        for sel in email_sels:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    loc.first.click()
-                    loc.first.fill(email)
-                    filled = True
-                    break
-                except Exception:
-                    pass
-        if not filled:
-            for loc in (
-                doc.get_by_label("Email", exact=False),
-                doc.get_by_label("Username", exact=False),
-                doc.get_by_placeholder("Email"),
-                doc.get_by_placeholder("Username"),
-                doc.get_by_role("textbox", name="Email", exact=False),
-            ):
-                if loc and loc.count():
-                    try:
-                        loc.first.click()
-                        loc.first.fill(email)
-                        filled = True
-                        break
-                    except Exception:
-                        pass
-        if not filled:
-            return False
-
-        _press_submit(doc)
-        return True
-
-    def _fill_password_then_submit(doc) -> bool:
-        pass_sels = [
-            "#password", "input[name='password']",
-            "input[type='password']",
-            "input[autocomplete='current-password']",
-            "input[placeholder*='password' i]",
-        ]
-        for sel in pass_sels:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    loc.first.click()
-                    loc.first.fill(password)
-                    _press_submit(doc)
-                    return True
-                except Exception:
-                    pass
-        for loc in (
-            doc.get_by_label("Password", exact=False),
-            doc.get_by_placeholder("Password"),
-        ):
-            if loc and loc.count():
-                try:
-                    loc.first.click()
-                    loc.first.fill(password)
-                    _press_submit(doc)
-                    return True
-                except Exception:
-                    pass
-        return False
-
-    def _try_login_in(doc) -> bool:
-        try:
-            doc.wait_for_selector("input,button,form", timeout=15000)
-        except Exception:
-            return False
-        _fill_email_then_submit(doc)
-        if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
-            return True
-        doc.wait_for_timeout(700)
-        _fill_password_then_submit(doc)
-        return ("web.quartr.com" in page.url) and ("auth.quartr.com" not in page.url)
-
-    # Start at the app and let it redirect to live Keycloak URL
-    page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
-    _dismiss_cookies(page)
-
-    if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
-        return
-
-    if _try_login_in(page):
+    # If already logged in
+    if "home" in page.url and "auth" not in page.url:
         return
 
     try:
-        for fr in page.frames:
-            if fr == page.main_frame:
-                continue
-            if _try_login_in(fr):
-                return
+        page.get_by_role("link", name="Log in").click()
     except Exception:
         pass
 
-    png = _save_png(page, "login_fail")
-    html = _save_html(page, "login_fail")
-    raise RuntimeError(
-        f"Login failed; URL: {page.url}. "
-        f"Screenshot: /debug/snap/{png} , HTML: /debug/html/{html}"
-    )
+    # Email
+    email_input = page.get_by_label("Email", exact=False)
+    if email_input.count() == 0:
+        email_input = page.locator("input[type='email']")
+    email_input.fill(email)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+
+    # Password
+    pwd_input = page.get_by_label("Password", exact=False)
+    if pwd_input.count() == 0:
+        pwd_input = page.locator("input[type='password']")
+    pwd_input.fill(password)
+    page.keyboard.press("Enter")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1500)
+
+    if "home" not in page.url:
+        _save_png(page, "login_fail")
+        raise RuntimeError(f"Keycloak login failed; final URL: {page.url}")
 
 
-# ------------------------------
-# Minimal company-open (you can replace with your full flow later)
-# ------------------------------
+# ------------------ Company search ------------------
+
 def open_company(page, ticker: str):
     """
-    Very basic search → open first result that matches ticker.
-    Expand selectors later based on your UI screenshot/HTML if needed.
+    Quartr requires pressing '/' to focus search.
+    This tries that first, then falls back to clicking visible search inputs.
+    Finally it clicks the first result that mentions the ticker.
+    Saves a debug PNG with a clickable URL if it fails.
     """
-    # Try a few likely search inputs
-    cand = [
+    t = ticker.upper()
+
+    # Always start from home
+    page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(400)
+
+    # Strategy A: '/' hotkey
+    try:
+        page.keyboard.press("/")
+        page.wait_for_timeout(150)
+        page.keyboard.type(t)
+        page.keyboard.press("Enter")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    def _click_first_match(ctx) -> bool:
+        for loc in (
+            ctx.get_by_role("link", name=t, exact=False),
+            ctx.locator(f"a:has-text('{t}')"),
+        ):
+            if loc.count():
+                try:
+                    loc.first.click()
+                    ctx.wait_for_load_state("networkidle")
+                    return True
+                except Exception:
+                    pass
+        generic = ctx.get_by_text(t, exact=False)
+        if generic.count():
+            try:
+                el = generic.first
+                try:
+                    el.click()
+                except Exception:
+                    el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
+                ctx.wait_for_load_state("networkidle")
+                return True
+            except Exception:
+                pass
+        return False
+
+    if _click_first_match(page):
+        return
+
+    # Strategy B: search inputs
+    search_boxes = [
         page.get_by_placeholder("Search"),
+        page.get_by_role("combobox", name="Search", exact=False),
         page.locator("input[type='search']"),
         page.locator("input[placeholder*='Search' i]"),
+        page.locator("input[aria-label*='Search' i]"),
     ]
-    for sb in cand:
-        if sb and sb.count():
-            sb.first.click()
-            sb.first.fill(ticker)
-            page.keyboard.press("Enter")
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1200)
-            # click a link mentioning ticker
-            link = page.get_by_role("link", name=ticker.upper(), exact=False)
-            if link and link.count():
-                link.first.click()
+    for sb in search_boxes:
+        if sb.count():
+            try:
+                sb.first.click()
+                sb.first.fill(t)
+                page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle")
-                return
-    raise RuntimeError("Could not open company from search UI.")
+                page.wait_for_timeout(800)
+                if _click_first_match(page):
+                    return
+            except Exception:
+                continue
+
+    # Strategy C: direct URL
+    try:
+        page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(800)
+        if _click_first_match(page):
+            return
+    except Exception:
+        pass
+
+    fname = _save_png(page, f"open_company_fail_{t}")
+    raise RuntimeError(f"Could not open company from search UI. See /debug/snap/{fname}")
 
 
-# ------------------------------
-# Models & routes
-# ------------------------------
+# ------------------ Models ------------------
+
 class BackfillRequest(BaseModel):
     ticker: str
-    start_year: Optional[int] = None
-    end_year: Optional[int] = None
-    start_q: Optional[str] = None
-    end_q: Optional[str] = None
+    extra: Optional[str] = None
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
+# ------------------ Routes ------------------
 
 @app.get("/envcheck")
 def envcheck():
-    present = lambda k: bool(os.getenv(k))
     return {
-        "QUARTR_EMAIL": present("QUARTR_EMAIL"),
-        "QUARTR_PASSWORD": present("QUARTR_PASSWORD"),
-        "SUPABASE_URL": present("SUPABASE_URL"),
-        "SUPABASE_SERVICE_ROLE_KEY": present("SUPABASE_SERVICE_ROLE_KEY"),
-        "SUPABASE_BUCKET": os.getenv("SUPABASE_BUCKET", "earnings"),
+        "QUARTR_EMAIL": bool(QUARTR_EMAIL),
+        "QUARTR_PASSWORD": bool(QUARTR_PASSWORD),
+        "SUPABASE_URL": bool(SUPABASE_URL),
+        "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
+        "SUPABASE_BUCKET": SUPABASE_BUCKET
     }
-
-
-@app.get("/diag")
-def diag():
-    # Basic Supabase connectivity check (only if env is set)
-    try:
-        sb = supabase_client_server()
-        bucket = bucket_name()
-        entries = sb.storage.from_(bucket).list()
-        return {"ok": True, "bucket": bucket, "entries": len(entries or [])}
-    except Exception as e:
-        logger.error("Diag failed: %s\n%s", e, traceback.format_exc())
-        return {"ok": False, "error": str(e)}
 
 
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
-    # Pull creds from env
-    try:
-        email = require_env("QUARTR_EMAIL")
-        password = require_env("QUARTR_PASSWORD")
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=f"Config error: {e}")
-
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-            )
-            ctx = browser.new_context(
-                accept_downloads=True,
-                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-                viewport={"width": 1366, "height": 900},
-                locale="en-US",
-            )
-            page = ctx.new_page()
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-            # Login
-            login_keycloak(page, email, password)
-
-            # Optional: take a post-login shot for debugging once
+            login_keycloak(page, QUARTR_EMAIL, QUARTR_PASSWORD)
             _save_png(page, "after_login_home")
 
-            # Navigate to company (skeleton)
             open_company(page, req.ticker)
 
-            ctx.close()
+            # TODO: implement download + upload logic here
+
             browser.close()
-
-        return {"status": "ok", "note": "Login + open company succeeded (skeleton). Expand downloads next."}
-
+            return {"status": "ok"}
     except Exception as e:
-        logger.error("Backfill failed: %s\n%s", e, traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Unhandled error: {e}")
+        logger.exception("Backfill failed")
+        raise HTTPException(status_code=500, detail=f"Backfill failed: {e}")
