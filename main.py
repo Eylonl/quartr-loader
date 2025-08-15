@@ -5,7 +5,7 @@ import traceback
 from typing import Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
@@ -17,7 +17,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Quartr Loader", version="1.8 (debug screenshots)")
+app = FastAPI(title="Quartr Loader", version="1.9 (login harden + html dumps)")
 
 
 # ------------------------------
@@ -68,22 +68,34 @@ def upsert_row(sb, **row):
 
 
 # ------------------------------
-# Debug screenshot helpers & endpoint
+# Debug helpers & endpoints
 # ------------------------------
-def save_debug_shot(page, tag: str) -> str:
-    """Save a full-page PNG into /tmp and return the filename."""
+def _save_png(page, tag: str) -> str:
     fname = f"debug_{tag}_{int(time.time())}.png"
     path = f"/tmp/{fname}"
     try:
         page.screenshot(path=path, full_page=True)
-        logger.error("Saved debug screenshot: %s", path)
+        logger.error("Saved debug PNG: %s", path)
     except Exception as e:
-        logger.error("Failed to save debug screenshot: %s", e)
+        logger.error("Failed to save PNG: %s", e)
     return fname
+
+
+def _save_html(page, tag: str) -> str:
+    fname = f"debug_{tag}_{int(time.time())}.html"
+    path = f"/tmp/{fname}"
+    try:
+        html = page.content()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.error("Saved debug HTML: %s", path)
+    except Exception as e:
+        logger.error("Failed to save HTML: %s", e)
+    return fname
+
 
 @app.get("/debug/snap/{fname}")
 def debug_snap(fname: str):
-    # Only allow /tmp files we created
     safe = os.path.basename(fname)
     path = f"/tmp/{safe}"
     if not os.path.exists(path):
@@ -91,29 +103,36 @@ def debug_snap(fname: str):
     return FileResponse(path, media_type="image/png")
 
 
+@app.get("/debug/html/{fname}")
+def debug_html(fname: str):
+    safe = os.path.basename(fname)
+    path = f"/tmp/{safe}"
+    if not os.path.exists(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    with open(path, "r", encoding="utf-8") as f:
+        return PlainTextResponse(f.read(), media_type="text/html")
+
+
+@app.get("/debug/list_tmp")
+def debug_list_tmp():
+    files = [f for f in os.listdir("/tmp") if f.endswith(".png") or f.endswith(".html")]
+    return {"files": files}
+
+
 # ------------------------------
-# Keycloak login flow (robust)
+# Keycloak login (hardened)
 # ------------------------------
 def login_keycloak(page, email: str, password: str):
     """
-    Logs in via Quartr's Keycloak page.
-    Tries explicit QUARTR_LOGIN_URL (or provided URL), then falls back by letting
-    web.quartr.com redirect to the active Keycloak URL. Handles iframes and late render.
+    Opens web.quartr.com (SPA), lets it redirect to current Keycloak URL.
+    Then finds username/password fields in the page or any iframe and submits.
+    If it fails, dumps screenshot + HTML with URLs for inspection.
     """
-    provided_url = (
-        "https://auth.quartr.com/realms/prod/protocol/openid-connect/auth"
-        "?response_type=code&client_id=web"
-        "&redirect_uri=https%3A%2F%2Fweb.quartr.com%2Fapi%2Fauth%2Fcallback%2Fkeycloak"
-        "&code_challenge=1pq9sKtxWv6EouXakPlyEFXYbuV9sKIkzaGL26g9ss8"
-        "&code_challenge_method=S256&scope=openid+profile+email"
-    )
-    login_url = os.getenv("QUARTR_LOGIN_URL") or provided_url
-
-    page.set_default_timeout(50000)
+    page.set_default_timeout(60000)
 
     def _dismiss_cookies(doc):
         try:
-            for txt in ["Accept", "Agree", "Allow all", "OK", "I agree"]:
+            for txt in ["Accept", "Agree", "Allow all", "OK", "I agree", "Accept all cookies"]:
                 btn = doc.get_by_role("button", name=txt, exact=False)
                 if btn and btn.count():
                     btn.first.click()
@@ -122,43 +141,60 @@ def login_keycloak(page, email: str, password: str):
         except Exception:
             pass
 
-    def _fill_on(doc) -> bool:
-        """Try to fill on a given document context (page or frame)."""
-        try:
-            doc.wait_for_selector("input, button[type='submit'], #kc-login", timeout=15000)
-        except Exception:
-            return False
-
-        # Some Keycloak themes show an intermediate step
-        try:
-            for txt in ["Continue with Email", "Continue", "Sign in with email", "Email"]:
+    def _maybe_click_email_continue(doc):
+        for txt in ["Continue with Email", "Continue", "Sign in with email", "Email"]:
+            try:
                 b = doc.get_by_role("button", name=txt, exact=False)
                 if b and b.count():
                     b.first.click()
-                    doc.wait_for_timeout(400)
-        except Exception:
-            pass
+                    doc.wait_for_timeout(500)
+                    return True
+            except Exception:
+                continue
+        return False
 
-        user_sel = [
-            "#username", "input[name='username']",
-            "input[type='email']", "input[placeholder*='email' i]",
+    def _fill_fields(doc) -> bool:
+        # Wait for anything interactive
+        try:
+            doc.wait_for_selector("input,button,form", timeout=15000)
+        except Exception:
+            return False
+
+        _dismiss_cookies(doc)
+        _maybe_click_email_continue(doc)
+
+        # Username/email selectors
+        email_sels = [
+            "#username",
+            "input#email",
+            "input[name='username']",
+            "input[name='email']",
+            "input[type='email']",
+            "input[autocomplete='username']",
+            "input[placeholder*='email' i]",
             "input[placeholder*='username' i]",
         ]
-        pass_sel = [
-            "#password", "input[name='password']",
-            "input[type='password']", "input[placeholder*='password' i]",
+        # Password selectors
+        pass_sels = [
+            "#password",
+            "input[name='password']",
+            "input[type='password']",
+            "input[autocomplete='current-password']",
+            "input[placeholder*='password' i]",
         ]
 
-        # Username/email
-        for sel in user_sel:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    loc.first.fill(email)
-                    break
-                except Exception:
-                    pass
-        else:
+        def _fill_one(selectors, value) -> bool:
+            # Try CSS selectors
+            for sel in selectors:
+                loc = doc.locator(sel)
+                if loc and loc.count():
+                    try:
+                        loc.first.click()
+                        loc.first.fill(value)
+                        return True
+                    except Exception:
+                        pass
+            # Label/placeholder fallbacks
             for loc in (
                 doc.get_by_label("Email", exact=False),
                 doc.get_by_label("Username", exact=False),
@@ -168,38 +204,19 @@ def login_keycloak(page, email: str, password: str):
             ):
                 if loc and loc.count():
                     try:
-                        loc.first.fill(email)
-                        break
+                        loc.first.click()
+                        loc.first.fill(value)
+                        return True
                     except Exception:
                         pass
-            else:
-                return False
+            return False
 
-        # Password
-        for sel in pass_sel:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    loc.first.fill(password)
-                    break
-                except Exception:
-                    pass
-        else:
-            for loc in (
-                doc.get_by_label("Password", exact=False),
-                doc.get_by_placeholder("Password"),
-                doc.get_by_role("textbox", name="Password", exact=False),
-            ):
-                if loc and loc.count():
-                    try:
-                        loc.first.fill(password)
-                        break
-                    except Exception:
-                        pass
-            else:
-                return False
+        ok_user = _fill_one(email_sels, email)
+        ok_pass = _fill_one(pass_sels, password)
+        if not (ok_user and ok_pass):
+            return False
 
-        # Submit
+        # Submit candidates
         for btn in (
             doc.locator("#kc-login"),
             doc.get_by_role("button", name="Sign in", exact=False),
@@ -209,7 +226,6 @@ def login_keycloak(page, email: str, password: str):
         ):
             if btn and btn.count():
                 try:
-                    # Some Keycloak themes navigate fully, others SPA-transition
                     with doc.expect_navigation(wait_until="load", timeout=20000):
                         btn.first.click()
                 except Exception:
@@ -218,7 +234,7 @@ def login_keycloak(page, email: str, password: str):
                 doc.wait_for_timeout(800)
                 return True
 
-        # Fallback: Enter key
+        # Fallback: press Enter
         try:
             doc.keyboard.press("Enter")
             doc.wait_for_load_state("networkidle")
@@ -227,44 +243,41 @@ def login_keycloak(page, email: str, password: str):
         except Exception:
             return False
 
-    def _attempt(url: str) -> bool:
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
-        _dismiss_cookies(page)
-
-        # Try on the main page
-        if _fill_on(page):
-            if "web.quartr.com" in page.url:
-                return True
-
-        # Try any iframes
-        try:
-            for fr in page.frames:
-                if fr == page.main_frame:
-                    continue
-                _dismiss_cookies(fr)
-                if _fill_on(fr):
-                    if "web.quartr.com" in page.url:
-                        return True
-        except Exception:
-            pass
-
-        if "auth.quartr.com" in page.url:
-            page.wait_for_timeout(2000)
-        return "web.quartr.com" in page.url
-
-    # 1) Try explicit URL
-    if _attempt(login_url):
-        return
-
-    # 2) Let app push us to active auth URL then attempt there
+    # 1) Start from app and let it redirect us to live Keycloak auth page
     page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    if _attempt(page.url):
+    _dismiss_cookies(page)
+
+    # If we are already authenticated (no redirect), great:
+    if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
         return
 
-    snap = save_debug_shot(page, "keycloak_fail")
-    raise RuntimeError(f"Keycloak login failed; final URL: {page.url}. Screenshot: /debug/snap/{snap}")
+    # Else we should be on Keycloak or being redirected to it. Wait a hair.
+    page.wait_for_timeout(500)
+
+    # Try main page
+    if _fill_fields(page):
+        if "web.quartr.com" in page.url:
+            return
+
+    # Try iframes
+    try:
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            if _fill_fields(fr):
+                if "web.quartr.com" in page.url:
+                    return
+    except Exception:
+        pass
+
+    # Debug dumps for inspection
+    png = _save_png(page, "login_fail")
+    html = _save_html(page, "login_fail")
+    raise RuntimeError(
+        f"Login failed at URL: {page.url}. "
+        f"Screenshot: /debug/snap/{png} , HTML: /debug/html/{html}"
+    )
 
 
 # ------------------------------
@@ -285,17 +298,11 @@ def open_home(page):
 def open_company(page, ticker: str):
     """
     Robustly open a company page given a ticker.
-    Tries:
-      1) Header search (several selectors)
-      2) Keyboard "/" to focus search then Enter
-      3) Direct search page fallback: /search?q=<TICKER>
-    Then clicks the first result that mentions the ticker.
-    If all fail, saves a screenshot and raises.
     """
     t = ticker.upper()
 
     def _click_first_match(ctx) -> bool:
-        # Try links first (best signal)
+        # Prefer links
         for loc in (
             ctx.get_by_role("link", name=t, exact=False),
             ctx.locator(f"a:has-text('{t}')"),
@@ -307,8 +314,7 @@ def open_company(page, ticker: str):
                     return True
                 except Exception:
                     pass
-
-        # Then any element naming the ticker (cards/tiles)
+        # Any element containing ticker
         generic = ctx.get_by_text(t, exact=False)
         if generic and generic.count():
             try:
@@ -323,7 +329,7 @@ def open_company(page, ticker: str):
                 pass
         return False
 
-    # Always start from home
+    # Start from home
     try:
         page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
@@ -331,7 +337,7 @@ def open_company(page, ticker: str):
     except Exception:
         pass
 
-    # Strategy 1: header search field(s)
+    # Header search strategies
     search_boxes = [
         page.get_by_placeholder("Search"),
         page.get_by_role("combobox", name="Search", exact=False),
@@ -352,7 +358,7 @@ def open_company(page, ticker: str):
         except Exception:
             continue
 
-    # Strategy 2: try focusing search via "/" hotkey then enter
+    # "/" hotkey
     try:
         page.keyboard.press("/")
         page.wait_for_timeout(200)
@@ -365,7 +371,7 @@ def open_company(page, ticker: str):
     except Exception:
         pass
 
-    # Strategy 3: direct search page (common SPA route)
+    # Direct search route
     try:
         page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
@@ -375,8 +381,8 @@ def open_company(page, ticker: str):
     except Exception:
         pass
 
-    snap = save_debug_shot(page, f"open_company_fail_{t}")
-    raise RuntimeError(f"Could not open company from search UI. Screenshot: /debug/snap/{snap}")
+    png = _save_png(page, f"open_company_fail_{t}")
+    raise RuntimeError(f"Could not open company from search UI. Screenshot: /debug/snap/{png}")
 
 
 def open_quarter(page, year: int, quarter: str) -> bool:
@@ -449,12 +455,6 @@ def debug_ping():
     return {"ok": True}
 
 
-@app.get("/debug/list_tmp")
-def debug_list_tmp():
-    files = [f for f in os.listdir("/tmp") if f.endswith(".png")]
-    return {"files": files}
-
-
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
     # Validate env first
@@ -485,12 +485,11 @@ def backfill(req: BackfillRequest):
             )
             page = ctx.new_page()
 
-            # Login via Keycloak
+            # Login
             login_keycloak(page, email, password)
 
-            # Land on home to ensure SPA has loaded; take a debug shot
+            # Land on home and continue
             open_home(page)
-            save_debug_shot(page, "after_login_home")
 
             LABELS = [
                 ("Transcript", "transcript"),
@@ -510,8 +509,7 @@ def backfill(req: BackfillRequest):
                 for qi in range(q_start, q_end + 1):
                     q = f"Q{qi}"
                     if not open_quarter(page, year, q):
-                        # save where it failed to select the quarter
-                        save_debug_shot(page, f"open_quarter_fail_{req.ticker}_{year}_{q}")
+                        _save_png(page, f"open_quarter_fail_{req.ticker}_{year}_{q}")
                         logger.warning("Quarter not found: %s %s %s", req.ticker, year, q)
                         continue
 
