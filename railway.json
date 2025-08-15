@@ -1,0 +1,28 @@
+{
+  "build": {
+    "builder": "dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "restartPolicyType": "ON_FAILURE",
+    "healthcheckPath": "/docs"
+  },
+  "env": {
+    "QUARTR_EMAIL": {
+      "required": true
+    },
+    "QUARTR_PASSWORD": {
+      "required": true
+    },
+    "SUPABASE_URL": {
+      "required": true
+    },
+    "SUPABASE_SERVICE_ROLE_KEY": {
+      "required": true
+    },
+    "SUPABASE_BUCKET": {
+      "required": false,
+      "value": "earnings"
+    }
+  }
+}
