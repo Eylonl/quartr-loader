@@ -2,32 +2,45 @@ import os
 import time
 import logging
 from typing import List
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# -------- Logging --------
+# ───────────────────────── Logging / Config ─────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-# -------- Config / ENV --------
-PW_DEFAULT_TIMEOUT_MS = int(os.getenv("PW_DEFAULT_TIMEOUT_MS", "15000"))
+app = FastAPI(title="Quartr Loader", version="3.0")
+
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL", "")
 QUARTR_PASSWORD = os.getenv("QUARTR_PASSWORD", "")
 
-# Debug artifact dirs (served by endpoints below)
+# Playwright timeouts and a hard watchdog for /backfill
+PW_DEFAULT_TIMEOUT_MS = int(os.getenv("PW_DEFAULT_TIMEOUT_MS", "15000"))
+BACKFILL_MAX_SECONDS = int(os.getenv("BACKFILL_MAX_SECONDS", "150"))
+
+# Where debug artifacts live (served via endpoints below)
 TMP_DIR = "/tmp"
-DEBUG_PNG_DIR = TMP_DIR
-DEBUG_HTML_DIR = TMP_DIR
 
-# -------- FastAPI --------
-app = FastAPI(title="Quartr Loader", version="2.6")
+# Preferred company names when a ticker is ambiguous
+PREFERRED_COMPANY_BY_TICKER = {
+    "PCOR": ["Procore"],  # add more as needed
+}
 
-# ===== Debug helpers & endpoints =====
+# ───────────────────────── Models ─────────────────────────
+class BackfillRequest(BaseModel):
+    ticker: str
+    start_year: int
+    end_year: int
+    start_q: str = "Q1"
+    end_q: str = "Q4"
+
+# ───────────────────────── Debug utils + endpoints ─────────────────────────
 def _save_png(page, tag: str) -> str:
     fname = f"debug_{tag}_{int(time.time())}.png"
-    path = os.path.join(DEBUG_PNG_DIR, fname)
+    path = os.path.join(TMP_DIR, fname)
     try:
         page.screenshot(path=path, full_page=True)
         logger.error("Saved debug PNG: /debug/snap/%s", fname)
@@ -37,7 +50,7 @@ def _save_png(page, tag: str) -> str:
 
 def _save_html(page, tag: str) -> str:
     fname = f"debug_{tag}_{int(time.time())}.html"
-    path = os.path.join(DEBUG_HTML_DIR, fname)
+    path = os.path.join(TMP_DIR, fname)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(page.content())
@@ -62,22 +75,20 @@ def debug_latest():
 
 @app.get("/debug/snap/{fname}")
 def debug_snap(fname: str):
-    safe = os.path.basename(fname)
-    path = os.path.join(TMP_DIR, safe)
+    path = os.path.join(TMP_DIR, os.path.basename(fname))
     if not os.path.exists(path):
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(path, media_type="image/png")
 
 @app.get("/debug/html/{fname}")
 def debug_html(fname: str):
-    safe = os.path.basename(fname)
-    path = os.path.join(TMP_DIR, safe)
+    path = os.path.join(TMP_DIR, os.path.basename(fname))
     if not os.path.exists(path):
         return JSONResponse({"error": "not found"}, status_code=404)
     with open(path, "r", encoding="utf-8") as f:
         return PlainTextResponse(f.read(), media_type="text/html")
 
-# ===== Health/diag =====
+# ───────────────────────── Health / Env ─────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -88,22 +99,15 @@ def envcheck():
         "QUARTR_EMAIL": bool(QUARTR_EMAIL),
         "QUARTR_PASSWORD": bool(QUARTR_PASSWORD),
         "PW_DEFAULT_TIMEOUT_MS": PW_DEFAULT_TIMEOUT_MS,
+        "BACKFILL_MAX_SECONDS": BACKFILL_MAX_SECONDS,
     }
 
 @app.get("/diag")
 def diag():
-    # minimal diag; extend if needed
-    return {"ok": True, "debug_files": len([f for f in os.listdir(TMP_DIR) if f.startswith("debug_")])}
+    count = len([f for f in os.listdir(TMP_DIR) if f.startswith("debug_")])
+    return {"ok": True, "debug_files": count}
 
-# ===== Models =====
-class BackfillRequest(BaseModel):
-    ticker: str
-    start_year: int
-    end_year: int
-    start_q: str = "Q1"
-    end_q: str = "Q4"
-
-# ===== Login (robust, frames-aware) =====
+# ───────────────────────── Login (robust, frames-aware) ─────────────────────────
 def login_keycloak(page, email: str, password: str):
     page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
 
@@ -114,6 +118,7 @@ def login_keycloak(page, email: str, password: str):
     page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
 
+    # Already logged in?
     if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
         logger.info("LOGIN: already authenticated")
         return
@@ -193,8 +198,7 @@ def login_keycloak(page, email: str, password: str):
                 vis = loc.first
                 if vis.is_visible():
                     try:
-                        vis.click()
-                        vis.fill(value)
+                        vis.click(); vis.fill(value)
                         return True
                     except Exception:
                         continue
@@ -260,22 +264,21 @@ def login_keycloak(page, email: str, password: str):
     html = link_html("login_fail")
     raise RuntimeError(f"Keycloak login failed. URL: {page.url} | Frames: {frame_urls} | PNG: {png} | HTML: {html}")
 
-# ===== Company search (handles contenteditable command palette) =====
+# ───────────────────────── Company search (palette, contenteditable, preferences) ─────────────────────────
 def open_company(page, ticker: str):
     page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
     t = ticker.upper()
+    preferred_names = PREFERRED_COMPANY_BY_TICKER.get(t, [])
 
     def snap(tag):
-        _save_png(page, tag)
-        _save_html(page, tag)
+        _save_png(page, tag); _save_html(page, tag)
 
     # Home
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(150)
-    snap("open_home")
+    page.wait_for_timeout(120)
 
-    # Helpers for focus/contenteditable
+    # helpers
     def focused_is_textual():
         try:
             return page.evaluate("""() => {
@@ -297,21 +300,18 @@ def open_company(page, ticker: str):
             pass
         page.keyboard.type(text, delay=25)
 
-    # Open palette: try '/' then Ctrl+K
+    # Open palette: '/' then Ctrl+K; if not focused, click likely inputs
     opened = False
     for _ in range(2):
         try:
             page.keyboard.press("/")
-            page.wait_for_timeout(120)
-            if focused_is_textual().get("ok"):
-                opened = True; break
+            page.wait_for_timeout(100)
+            if focused_is_textual().get("ok"): opened = True; break
             page.keyboard.down("Control"); page.keyboard.press("KeyK"); page.keyboard.up("Control")
-            page.wait_for_timeout(120)
-            if focused_is_textual().get("ok"):
-                opened = True; break
+            page.wait_for_timeout(100)
+            if focused_is_textual().get("ok"): opened = True; break
         except Exception:
             pass
-
     if not opened:
         for sb in [
             page.get_by_placeholder("Search"),
@@ -329,84 +329,97 @@ def open_company(page, ticker: str):
                         opened = True; break
                 except Exception:
                     continue
-    snap("after_open_palette")
+    snap("open_company_after_open_palette")
 
-    # Type ticker
+    # Type ticker -> Enter
     if focused_is_textual().get("ok"):
         type_in_focused(t)
-        page.wait_for_timeout(100)
+        page.wait_for_timeout(80)
         page.keyboard.press("Enter")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(250)
-    snap(f"after_enter_{t}")
+        page.wait_for_timeout(200)
+    snap(f"open_company_after_enter_{t}")
 
-    # Wait containers
+    # Find Companies section (like in your screenshot)
+    companies_section = None
     for sel in [
-        "[data-testid*='search']",
-        "[data-state='open'] [role='listbox']",
-        "[role='listbox']",
-        "[role='dialog']",
-        "div[role='presentation']",
-        "div[role='list']",
+        "section:has-text('Companies')",
+        "div:has(> h2:has-text('Companies'))",
+        "div:has-text('Companies')"
     ]:
         try:
-            page.wait_for_selector(sel, timeout=1200)
-            break
+            sec = page.locator(sel)
+            if sec and sec.count():
+                companies_section = sec.first
+                break
         except Exception:
             continue
-    snap(f"after_results_{t}")
+    if companies_section is None:
+        # fallback to dedicated search page
+        try:
+            page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(200)
+            snap(f"open_company_direct_search_{t}")
+            for sel in [
+                "section:has-text('Companies')",
+                "div:has(> h2:has-text('Companies'))",
+                "div:has-text('Companies')"
+            ]:
+                sec = page.locator(sel)
+                if sec and sec.count():
+                    companies_section = sec.first
+                    break
+        except Exception:
+            pass
 
-    # Click match
-    def click_first(ctx) -> bool:
-        cands = [
-            ctx.get_by_role("option", name=t, exact=False),
-            ctx.get_by_role("link", name=t, exact=False),
-            ctx.get_by_role("button", name=t, exact=False),
-            ctx.locator(f"a:has-text('{t}')"),
-            ctx.locator(f"button:has-text('{t}')"),
-            ctx.locator(f"[data-testid*='company']:has-text('{t}')"),
-            ctx.locator(f"[class*='card']:has-text('{t}')"),
-            ctx.locator(f"text=/\\b{t}\\b/"),
-        ]
+    def click_match(ctx, name_contains: str | None = None) -> bool:
+        # prefer candidate that mentions both name and ticker
+        cands = []
+        if name_contains:
+            cands += [
+                ctx.get_by_role("link", name=name_contains, exact=False).filter(has_text=t),
+                ctx.get_by_role("button", name=name_contains, exact=False).filter(has_text=t),
+                ctx.locator(f"[class*='card']:has-text('{name_contains}'):has-text('{t}')"),
+                ctx.locator(f"a:has-text('{name_contains}'):has-text('{t}')"),
+                ctx.locator(f"button:has-text('{name_contains}'):has-text('{t}')"),
+            ]
+        else:
+            cands += [
+                ctx.get_by_role("link", name=t, exact=False),
+                ctx.get_by_role("button", name=t, exact=False),
+                ctx.locator(f"[class*='card']:has-text('{t}')"),
+                ctx.locator(f"a:has-text('{t}')"),
+                ctx.locator(f"button:has-text('{t}')"),
+                ctx.locator(f"text=/\\b{t}\\b/"),
+            ]
         for loc in cands:
             try:
                 if loc and loc.count():
+                    loc.first.scroll_into_view_if_needed(timeout=500)
                     loc.first.click()
-                    ctx.wait_for_load_state("networkidle")
+                    page.wait_for_load_state("networkidle")
+                    snap(f"open_company_clicked_{t}_{name_contains or 'ticker'}")
                     return True
             except Exception:
                 continue
-        try:
-            el = ctx.get_by_text(t, exact=False).first
-            if el and el.is_visible():
-                el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
-                ctx.wait_for_load_state("networkidle")
-                return True
-        except Exception:
-            pass
         return False
 
-    if click_first(page):
-        snap(f"clicked_result_{t}")
-        return
-
-    # Fallback: direct search URL
-    try:
-        page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(250)
-        snap(f"direct_search_{t}")
-        if click_first(page):
-            snap(f"clicked_result_direct_{t}")
-            return
-    except Exception:
-        pass
+    # Priority clicks
+    if companies_section and PREFERRED_COMPANY_BY_TICKER.get(t):
+        for nm in preferred_names:
+            if click_match(companies_section, nm): return
+    if companies_section and click_match(companies_section, None): return
+    if preferred_names:
+        for nm in preferred_names:
+            if click_match(page, nm): return
+    if click_match(page, None): return
 
     png = _save_png(page, f"open_company_fail_{t}")
     html = _save_html(page, f"open_company_fail_{t}")
-    raise RuntimeError(f"Could not open company from search UI. PNG: /debug/snap/{png} HTML: /debug/html/{html}")
+    raise RuntimeError(f"Could not open company for {t}. PNG: /debug/snap/{png} HTML: /debug/html/{html}")
 
-# ===== Quarter open =====
+# ───────────────────────── Open quarter ─────────────────────────
 def open_quarter(page, year: int, quarter: str) -> bool:
     page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
     labels = [f"{quarter} {year}", f"{quarter} FY{year}", f"{quarter} {str(year)[-2:]}"]
@@ -416,14 +429,14 @@ def open_quarter(page, year: int, quarter: str) -> bool:
             try:
                 loc.first.click()
                 page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(250)
                 _save_png(page, f"open_quarter_{year}_{quarter}")
                 return True
             except Exception:
                 continue
     return False
 
-# ===== Backfill =====
+# ───────────────────────── Backfill route (with watchdog) ─────────────────────────
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
     if not QUARTR_EMAIL or not QUARTR_PASSWORD:
@@ -432,6 +445,18 @@ def backfill(req: BackfillRequest):
     def qn(q: str) -> int:
         return int(q.replace("Q", ""))
 
+    start = time.monotonic()
+
+    def watchdog(step: str, page=None):
+        elapsed = time.monotonic() - start
+        if elapsed > BACKFILL_MAX_SECONDS:
+            try:
+                if page: _save_png(page, f"watchdog_{int(elapsed)}s_at_{step.replace(' ', '_')}")
+            except Exception:
+                pass
+            raise HTTPException(status_code=504, detail=f"Backfill exceeded {BACKFILL_MAX_SECONDS}s at step: {step}")
+
+    browser = None
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
@@ -441,25 +466,40 @@ def backfill(req: BackfillRequest):
             page = browser.new_page()
             page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
 
-            # 1) Login
+            logger.info("STEP 1: login")
             login_keycloak(page, QUARTR_EMAIL, QUARTR_PASSWORD)
+            watchdog("login", page)
 
-            # 2) Company
+            logger.info("STEP 2: open company")
             open_company(page, req.ticker)
+            watchdog("open_company", page)
 
-            # 3) Iterate requested quarters (no downloads yet)
+            logger.info("STEP 3: iterate quarters")
             start_qn = qn(req.start_q); end_qn = qn(req.end_q)
             for year in range(req.start_year, req.end_year + 1):
                 q_from = start_qn if year == req.start_year else 1
-                q_to = end_qn if year == req.end_year else 4
+                q_to   = end_qn   if year == req.end_year else 4
                 for qi in range(q_from, q_to + 1):
-                    if not open_quarter(page, year, f"Q{qi}"):
-                        _save_png(page, f"open_quarter_fail_{req.ticker}_{year}_Q{qi}")
+                    qlabel = f"Q{qi}"
+                    ok = open_quarter(page, year, qlabel)
+                    watchdog(f"open_quarter_{year}_{qlabel}", page)
+                    if not ok:
+                        _save_png(page, f"open_quarter_fail_{req.ticker}_{year}_{qlabel}")
                         continue
-                    # TODO: add download & upload logic here
+                    # TODO: add download/upload logic here (press release / slides / transcript)
 
-            browser.close()
             return {"status": "ok", "ticker": req.ticker}
+
+    except HTTPException:
+        raise
+    except PWTimeoutError as e:
+        logger.exception("Playwright timeout")
+        raise HTTPException(status_code=504, detail=f"Playwright timeout: {e}")
     except Exception as e:
         logger.exception("Backfill failed")
         raise HTTPException(status_code=500, detail=f"Backfill failed: {e}")
+    finally:
+        try:
+            if browser: browser.close()
+        except Exception:
+            pass
