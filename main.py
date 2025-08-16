@@ -8,13 +8,13 @@ from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 
-# Optional: used by /diag only
+# Optional: only used by /diag
 from supabase import create_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-app = FastAPI(title="Quartr Loader", version="2.3")
+app = FastAPI(title="Quartr Loader", version="2.4 (robust login + debug + quarter window)")
 
 # ------------------ Environment ------------------
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL")
@@ -96,23 +96,35 @@ def debug_latest():
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# ------------------ Login (robust, 2-step, frames-aware) ------------------
+# ------------------ Login (robust, frames-aware) ------------------
 def login_keycloak(page, email: str, password: str):
     """
-    Start at web.quartr.com, let it redirect to live Keycloak.
-    Find email/password in page OR any iframe via multiple selectors.
-    Submit after each step. On failure, dump PNG+HTML with clickable URLs.
+    Robust Keycloak login:
+    - Go to web.quartr.com and let it redirect to Keycloak (auth.quartr.com)
+    - Find email/password in the main page OR any iframe (visible only)
+    - Submit after each step
+    - On failure, dump PNG+HTML with clickable URLs and include frame diagnostics
     """
     page.set_default_timeout(60000)
 
-    # Go to app and allow redirect
+    def _link_png(tag):
+        fname = _save_png(page, tag)
+        return f"/debug/snap/{fname}"
+
+    def _link_html(tag):
+        fname = _save_html(page, tag)
+        return f"/debug/html/{fname}"
+
+    # 1) Go to app; allow redirect/auth boot
     page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    _save_png(page, "login_stage_app")
 
-    # If already logged in, nothing to do
+    # already logged in?
     if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
         return
+
+    # give the SPA a moment to push us to Keycloak
+    page.wait_for_timeout(800)
 
     def _dismiss_cookies(doc):
         try:
@@ -125,27 +137,30 @@ def login_keycloak(page, email: str, password: str):
         except Exception:
             pass
 
-    def _press_submit(doc):
-        for sel in ["#kc-login", "button#kc-login", "button[type='submit']", "input[type='submit']"]:
+    def _press_submit(doc) -> bool:
+        # common submit buttons
+        for sel in ["#kc-login", "button#kc-login", "button[name='login']", "button[type='submit']", "input[type='submit']"]:
             loc = doc.locator(sel)
             if loc and loc.count():
                 try:
-                    with doc.expect_navigation(wait_until="load", timeout=20000):
+                    with doc.expect_navigation(wait_until="load", timeout=15000):
                         loc.first.click()
                 except Exception:
                     loc.first.click()
                 doc.wait_for_load_state("networkidle")
                 return True
-        for txt in ["Next", "Continue", "Continue with Email", "Sign in", "Log in"]:
+        # text buttons
+        for txt in ["Next", "Continue", "Continue with Email", "Sign in", "Sign In", "Log in", "Log In"]:
             loc = doc.get_by_role("button", name=txt, exact=False)
             if loc and loc.count():
                 try:
-                    with doc.expect_navigation(wait_until="load", timeout=20000):
+                    with doc.expect_navigation(wait_until="load", timeout=15000):
                         loc.first.click()
                 except Exception:
                     loc.first.click()
                 doc.wait_for_load_state("networkidle")
                 return True
+        # Enter fallback
         try:
             doc.keyboard.press("Enter")
             doc.wait_for_load_state("networkidle")
@@ -153,119 +168,116 @@ def login_keycloak(page, email: str, password: str):
         except Exception:
             return False
 
-    def _fill_email(doc) -> bool:
-        _dismiss_cookies(doc)
-        # sometimes there's an intermediate "Continue with Email"
-        try:
-            btn = doc.get_by_role("button", name="Continue", exact=False)
-            if btn and btn.count():
-                btn.first.click()
-                doc.wait_for_timeout(300)
-        except Exception:
-            pass
-
-        email_selectors = [
-            "#username", "input#email",
-            "input[name='username']", "input[name='email']",
-            "input[type='email']", "input[autocomplete='username']",
-            "input[placeholder*='email' i]", "input[placeholder*='username' i]",
-        ]
-        # try CSS selectors
-        for sel in email_selectors:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    loc.first.click(); loc.first.fill(email)
-                    return True
-                except Exception:
-                    pass
-        # try label/placeholder finders
-        for loc in (
-            doc.get_by_label("Email", exact=False),
-            doc.get_by_label("Username", exact=False),
-            doc.get_by_placeholder("Email"),
-            doc.get_by_placeholder("Username"),
-            doc.get_by_role("textbox", name="Email", exact=False),
-        ):
-            if loc and loc.count():
-                try:
-                    loc.first.click(); loc.first.fill(email)
-                    return True
-                except Exception:
-                    pass
+    def _fill_text(doc, value, candidates) -> bool:
+        # try CSS selectors first
+        for sel in candidates:
+            try:
+                loc = doc.locator(sel)
+                if loc and loc.count():
+                    # choose a visible one
+                    for i in range(min(loc.count(), 5)):
+                        el = loc.nth(i)
+                        if el.is_visible():
+                            el.click()
+                            el.fill(value)
+                            return True
+            except Exception:
+                continue
+        # label/placeholder fallbacks
+        if value == email:
+            fallbacks = [
+                doc.get_by_label("Email", exact=False),
+                doc.get_by_label("Username", exact=False),
+                doc.get_by_placeholder("Email"),
+                doc.get_by_placeholder("Username"),
+                doc.get_by_role("textbox", name="Email", exact=False),
+            ]
+        else:
+            fallbacks = [
+                doc.get_by_label("Password", exact=False),
+                doc.get_by_placeholder("Password"),
+                doc.get_by_role("textbox", name="Password", exact=False),
+            ]
+        for loc in fallbacks:
+            try:
+                if loc and loc.count():
+                    vis = loc.first
+                    if vis.is_visible():
+                        vis.click()
+                        vis.fill(value)
+                        return True
+            except Exception:
+                continue
         return False
 
-    def _fill_password(doc) -> bool:
-        pw_selectors = [
-            "#password", "input[name='password']",
-            "input[type='password']", "input[autocomplete='current-password']",
-            "input[placeholder*='password' i]",
-        ]
-        for sel in pw_selectors:
-            loc = doc.locator(sel)
-            if loc and loc.count():
-                try:
-                    loc.first.click(); loc.first.fill(password)
-                    return True
-                except Exception:
-                    pass
-        for loc in (
-            doc.get_by_label("Password", exact=False),
-            doc.get_by_placeholder("Password"),
-        ):
-            if loc and loc.count():
-                try:
-                    loc.first.click(); loc.first.fill(password)
-                    return True
-                except Exception:
-                    pass
-        return False
+    def _maybe_continue_email(doc):
+        for nm in ["Continue with Email", "Continue", "Email"]:
+            try:
+                b = doc.get_by_role("button", name=nm, exact=False)
+                if b and b.count() and b.first.is_visible():
+                    b.first.click()
+                    doc.wait_for_timeout(300)
+                    return
+            except Exception:
+                continue
 
-    def _try_login_on(doc) -> bool:
-        # Wait for interactive elements
+    def _attempt(doc) -> bool:
+        # wait for interactive elements
         try:
             doc.wait_for_selector("input,button,form", timeout=15000)
         except Exception:
             return False
-        _save_png(page, "login_stage_auth")
-        _save_html(page, "login_stage_auth")
 
-        # Step 1: email → submit
-        if _fill_email(doc):
+        _dismiss_cookies(doc)
+        _maybe_continue_email(doc)
+
+        # Email phase
+        email_candidates = [
+            "#username", "input#username", "input#email",
+            "input[name='username']", "input[name='email']",
+            "input[type='email']", "input[autocomplete='username']",
+            "input[placeholder*='email' i]", "input[placeholder*='username' i]",
+        ]
+        if _fill_text(doc, email, email_candidates):
             _press_submit(doc)
             if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
                 return True
 
-        # Step 2: password (if page presents it) → submit
+        # Password phase (if shown)
         doc.wait_for_timeout(600)
-        if _fill_password(doc):
+        pw_candidates = [
+            "#password", "input#password", "input[name='password']",
+            "input[type='password']", "input[autocomplete='current-password']",
+            "input[placeholder*='password' i]",
+        ]
+        if _fill_text(doc, password, pw_candidates):
             _press_submit(doc)
             if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
                 return True
 
-        # Some tenants may accept email-only → redirect
+        # maybe email-only redirect
         return "web.quartr.com" in page.url and "auth.quartr.com" not in page.url
 
-    # Try on main page
-    if _try_login_on(page):
+    # main page first
+    if _attempt(page):
         return
 
-    # Try on all iframes
-    try:
-        for fr in page.frames:
-            if fr == page.main_frame:
-                continue
-            if _try_login_on(fr):
+    # any iframe
+    frame_urls = []
+    for fr in page.frames:
+        try:
+            frame_urls.append(fr.url)
+            if _attempt(fr):
                 return
-    except Exception:
-        pass
+        except Exception:
+            continue
 
-    # Failure: dump artifacts
-    png = _save_png(page, "login_fail")
-    html = _save_html(page, "login_fail")
+    # failure: dump artifacts + diagnostics
+    png = _link_png("login_fail")
+    html = _link_html("login_fail")
     raise RuntimeError(
-        f"Login failed; URL: {page.url}. "
-        f"Screenshot: /debug/snap/{png} , HTML: /debug/html/{html}"
+        f"Keycloak login failed. URL: {page.url} | Frames tried: {frame_urls} | "
+        f"Screenshot: {png} | HTML: {html}"
     )
 
 # ------------------ Company search (press '/' first) ------------------
@@ -419,10 +431,10 @@ def backfill(req: BackfillRequest):
             )
             page = browser.new_page()
 
-            # 1) Login (robust)
+            # 1) Login
             login_keycloak(page, QUARTR_EMAIL, QUARTR_PASSWORD)
 
-            # 2) Company page (press '/' first)
+            # 2) Company page
             open_company(page, req.ticker)
 
             # 3) Iterate quarters
