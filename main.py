@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-app = FastAPI(title="Quartr Loader", version="3.0")
+app = FastAPI(title="Quartr Loader", version="3.1")
 
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL", "")
 QUARTR_PASSWORD = os.getenv("QUARTR_PASSWORD", "")
@@ -26,7 +26,7 @@ TMP_DIR = "/tmp"
 
 # Preferred company names when a ticker is ambiguous
 PREFERRED_COMPANY_BY_TICKER = {
-    "PCOR": ["Procore"],  # add more as needed
+    "PCOR": ["Procore"],  # extend as needed, e.g., "SHOP": ["Shopify"], ...
 }
 
 # ───────────────────────── Models ─────────────────────────
@@ -266,19 +266,24 @@ def login_keycloak(page, email: str, password: str):
 
 # ───────────────────────── Company search (palette, contenteditable, preferences) ─────────────────────────
 def open_company(page, ticker: str):
+    """
+    Opens the company page from the 'Companies' results.
+    Prefers mapped names (e.g., PCOR → Procore). Falls back to first company card.
+    Saves PNG/HTML at key steps.
+    """
     page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
     t = ticker.upper()
-    preferred_names = PREFERRED_COMPANY_BY_TICKER.get(t, [])
+    preferred_names = PREFERRED_COMPANY_BY_TICKER.get(t, ["Procore"] if t == "PCOR" else [])
 
     def snap(tag):
         _save_png(page, tag); _save_html(page, tag)
 
-    # Home
+    # 1) Home → open palette ('/' then Enter) → type ticker
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(120)
+    page.wait_for_timeout(150)
 
-    # helpers
+    # try to focus the palette
     def focused_is_textual():
         try:
             return page.evaluate("""() => {
@@ -292,27 +297,14 @@ def open_company(page, ticker: str):
         except Exception:
             return {"ok": False}
 
-    def type_in_focused(text: str):
-        try:
-            page.keyboard.down("Control"); page.keyboard.press("KeyA"); page.keyboard.up("Control")
-            page.keyboard.press("Backspace")
-        except Exception:
-            pass
-        page.keyboard.type(text, delay=25)
+    try:
+        page.keyboard.press("/")
+        page.wait_for_timeout(100)
+    except Exception:
+        pass
 
-    # Open palette: '/' then Ctrl+K; if not focused, click likely inputs
-    opened = False
-    for _ in range(2):
-        try:
-            page.keyboard.press("/")
-            page.wait_for_timeout(100)
-            if focused_is_textual().get("ok"): opened = True; break
-            page.keyboard.down("Control"); page.keyboard.press("KeyK"); page.keyboard.up("Control")
-            page.wait_for_timeout(100)
-            if focused_is_textual().get("ok"): opened = True; break
-        except Exception:
-            pass
-    if not opened:
+    if not focused_is_textual().get("ok"):
+        # click likely inputs
         for sb in [
             page.get_by_placeholder("Search"),
             page.get_by_role("combobox", name="Search", exact=False),
@@ -323,72 +315,63 @@ def open_company(page, ticker: str):
         ]:
             if sb and sb.count():
                 try:
-                    sb.first.click()
-                    page.wait_for_timeout(80)
-                    if focused_is_textual().get("ok"):
-                        opened = True; break
+                    sb.first.click(); page.wait_for_timeout(80); break
                 except Exception:
                     continue
-    snap("open_company_after_open_palette")
 
-    # Type ticker -> Enter
-    if focused_is_textual().get("ok"):
-        type_in_focused(t)
-        page.wait_for_timeout(80)
-        page.keyboard.press("Enter")
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(200)
+    # clear → type → Enter
+    try:
+        page.keyboard.down("Control"); page.keyboard.press("KeyA"); page.keyboard.up("Control")
+        page.keyboard.press("Backspace")
+    except Exception:
+        pass
+    page.keyboard.type(t, delay=20)
+    page.keyboard.press("Enter")
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(300)
     snap(f"open_company_after_enter_{t}")
 
-    # Find Companies section (like in your screenshot)
-    companies_section = None
+    # 2) Ensure we're on /search page (matches your screenshot layout)
+    if "/search" not in page.url:
+        page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(200)
+
+    # 3) Locate 'Companies' section container
+    companies = None
     for sel in [
         "section:has-text('Companies')",
         "div:has(> h2:has-text('Companies'))",
-        "div:has-text('Companies')"
+        "div:has-text('Companies')",
+        "main section >> nth=0",
     ]:
         try:
-            sec = page.locator(sel)
-            if sec and sec.count():
-                companies_section = sec.first
+            loc = page.locator(sel)
+            if loc and loc.count():
+                companies = loc.first
                 break
         except Exception:
             continue
-    if companies_section is None:
-        # fallback to dedicated search page
-        try:
-            page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(200)
-            snap(f"open_company_direct_search_{t}")
-            for sel in [
-                "section:has-text('Companies')",
-                "div:has(> h2:has-text('Companies'))",
-                "div:has-text('Companies')"
-            ]:
-                sec = page.locator(sel)
-                if sec and sec.count():
-                    companies_section = sec.first
-                    break
-        except Exception:
-            pass
+    if not companies:
+        snap(f"no_companies_section_{t}")
+        companies = page  # fallback to entire page
 
+    # 4) Click helpers
     def click_match(ctx, name_contains: str | None = None) -> bool:
-        # prefer candidate that mentions both name and ticker
         cands = []
         if name_contains:
             cands += [
-                ctx.get_by_role("link", name=name_contains, exact=False).filter(has_text=t),
-                ctx.get_by_role("button", name=name_contains, exact=False).filter(has_text=t),
                 ctx.locator(f"[class*='card']:has-text('{name_contains}'):has-text('{t}')"),
                 ctx.locator(f"a:has-text('{name_contains}'):has-text('{t}')"),
                 ctx.locator(f"button:has-text('{name_contains}'):has-text('{t}')"),
+                ctx.get_by_role("link", name=name_contains, exact=False).filter(has_text=t),
+                ctx.get_by_role("button", name=name_contains, exact=False).filter(has_text=t),
             ]
         else:
             cands += [
+                ctx.locator(f"[class*='card']:has-text('{t}')"),
                 ctx.get_by_role("link", name=t, exact=False),
                 ctx.get_by_role("button", name=t, exact=False),
-                ctx.locator(f"[class*='card']:has-text('{t}')"),
                 ctx.locator(f"a:has-text('{t}')"),
                 ctx.locator(f"button:has-text('{t}')"),
                 ctx.locator(f"text=/\\b{t}\\b/"),
@@ -396,25 +379,51 @@ def open_company(page, ticker: str):
         for loc in cands:
             try:
                 if loc and loc.count():
-                    loc.first.scroll_into_view_if_needed(timeout=500)
-                    loc.first.click()
+                    el = loc.first
+                    el.scroll_into_view_if_needed(timeout=800)
+                    try:
+                        el.click()
+                    except Exception:
+                        el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
                     page.wait_for_load_state("networkidle")
-                    snap(f"open_company_clicked_{t}_{name_contains or 'ticker'}")
+                    snap(f"clicked_{(name_contains or 'ticker').replace(' ', '_')}_{t}")
                     return True
             except Exception:
                 continue
         return False
 
-    # Priority clicks
-    if companies_section and PREFERRED_COMPANY_BY_TICKER.get(t):
-        for nm in preferred_names:
-            if click_match(companies_section, nm): return
-    if companies_section and click_match(companies_section, None): return
-    if preferred_names:
-        for nm in preferred_names:
-            if click_match(page, nm): return
-    if click_match(page, None): return
+    # Priority order:
+    # a) Preferred name inside Companies
+    for nm in preferred_names:
+        if click_match(companies, nm):
+            return
+    # b) Any ticker match inside Companies
+    if click_match(companies, None):
+        return
+    # c) Preferred name anywhere on page
+    for nm in preferred_names:
+        if click_match(page, nm):
+            return
+    # d) Ticker anywhere on page
+    if click_match(page, None):
+        return
 
+    # e) Final fallback: first company card in Companies section
+    try:
+        first_card = companies.locator("[class*='card'], [data-testid*='company'], a:has([alt])").first
+        if first_card and first_card.is_visible():
+            first_card.scroll_into_view_if_needed(timeout=800)
+            try:
+                first_card.click()
+            except Exception:
+                first_card.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
+            page.wait_for_load_state("networkidle")
+            snap(f"clicked_first_card_{t}")
+            return
+    except Exception:
+        pass
+
+    # Hard fail with artifacts
     png = _save_png(page, f"open_company_fail_{t}")
     html = _save_html(page, f"open_company_fail_{t}")
     raise RuntimeError(f"Could not open company for {t}. PNG: /debug/snap/{png} HTML: /debug/html/{html}")
@@ -478,7 +487,7 @@ def backfill(req: BackfillRequest):
             start_qn = qn(req.start_q); end_qn = qn(req.end_q)
             for year in range(req.start_year, req.end_year + 1):
                 q_from = start_qn if year == req.start_year else 1
-                q_to   = end_qn   if year == req.end_year else 4
+                q_to   = end_qn   if year == req.end_year   else 4
                 for qi in range(q_from, q_to + 1):
                     qlabel = f"Q{qi}"
                     ok = open_quarter(page, year, qlabel)
@@ -486,7 +495,7 @@ def backfill(req: BackfillRequest):
                     if not ok:
                         _save_png(page, f"open_quarter_fail_{req.ticker}_{year}_{qlabel}")
                         continue
-                    # TODO: add download/upload logic here (press release / slides / transcript)
+                    # TODO: add download/upload logic here
 
             return {"status": "ok", "ticker": req.ticker}
 
