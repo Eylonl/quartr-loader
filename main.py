@@ -6,7 +6,7 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 # Optional: only used by /diag
 from supabase import create_client
@@ -14,7 +14,7 @@ from supabase import create_client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-app = FastAPI(title="Quartr Loader", version="2.4 (robust login + debug + quarter window)")
+app = FastAPI(title="Quartr Loader", version="2.5 (watchdog + bounded timeouts)")
 
 # ------------------ Environment ------------------
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL")
@@ -22,6 +22,11 @@ QUARTR_PASSWORD = os.getenv("QUARTR_PASSWORD")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "earnings")
+
+# Global runtime cap for /backfill (seconds)
+BACKFILL_MAX_SECONDS = int(os.getenv("BACKFILL_MAX_SECONDS", "120"))
+# Default Playwright timeout per operation (ms)
+PW_DEFAULT_TIMEOUT_MS = int(os.getenv("PW_DEFAULT_TIMEOUT_MS", "15000"))
 
 def _require_env(name: str) -> str:
     v = os.getenv(name)
@@ -99,13 +104,9 @@ def debug_latest():
 # ------------------ Login (robust, frames-aware) ------------------
 def login_keycloak(page, email: str, password: str):
     """
-    Robust Keycloak login:
-    - Go to web.quartr.com and let it redirect to Keycloak (auth.quartr.com)
-    - Find email/password in the main page OR any iframe (visible only)
-    - Submit after each step
-    - On failure, dump PNG+HTML with clickable URLs and include frame diagnostics
+    Robust Keycloak login with bounded waits and screenshots on failure.
     """
-    page.set_default_timeout(60000)
+    page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
 
     def _link_png(tag):
         fname = _save_png(page, tag)
@@ -115,16 +116,15 @@ def login_keycloak(page, email: str, password: str):
         fname = _save_html(page, tag)
         return f"/debug/html/{fname}"
 
-    # 1) Go to app; allow redirect/auth boot
+    logger.info("LOGIN: navigate to app")
     page.goto("https://web.quartr.com/", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
 
-    # already logged in?
     if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
+        logger.info("LOGIN: already authenticated")
         return
 
-    # give the SPA a moment to push us to Keycloak
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(600)  # let SPA redirect
 
     def _dismiss_cookies(doc):
         try:
@@ -132,35 +132,32 @@ def login_keycloak(page, email: str, password: str):
                 btn = doc.get_by_role("button", name=txt, exact=False)
                 if btn and btn.count():
                     btn.first.click()
-                    doc.wait_for_timeout(250)
+                    doc.wait_for_timeout(200)
                     break
         except Exception:
             pass
 
     def _press_submit(doc) -> bool:
-        # common submit buttons
         for sel in ["#kc-login", "button#kc-login", "button[name='login']", "button[type='submit']", "input[type='submit']"]:
             loc = doc.locator(sel)
             if loc and loc.count():
                 try:
-                    with doc.expect_navigation(wait_until="load", timeout=15000):
+                    with doc.expect_navigation(wait_until="load", timeout=PW_DEFAULT_TIMEOUT_MS):
                         loc.first.click()
                 except Exception:
                     loc.first.click()
                 doc.wait_for_load_state("networkidle")
                 return True
-        # text buttons
         for txt in ["Next", "Continue", "Continue with Email", "Sign in", "Sign In", "Log in", "Log In"]:
             loc = doc.get_by_role("button", name=txt, exact=False)
             if loc and loc.count():
                 try:
-                    with doc.expect_navigation(wait_until="load", timeout=15000):
+                    with doc.expect_navigation(wait_until="load", timeout=PW_DEFAULT_TIMEOUT_MS):
                         loc.first.click()
                 except Exception:
                     loc.first.click()
                 doc.wait_for_load_state("networkidle")
                 return True
-        # Enter fallback
         try:
             doc.keyboard.press("Enter")
             doc.wait_for_load_state("networkidle")
@@ -169,12 +166,11 @@ def login_keycloak(page, email: str, password: str):
             return False
 
     def _fill_text(doc, value, candidates) -> bool:
-        # try CSS selectors first
+        # CSS selectors first
         for sel in candidates:
             try:
                 loc = doc.locator(sel)
                 if loc and loc.count():
-                    # choose a visible one
                     for i in range(min(loc.count(), 5)):
                         el = loc.nth(i)
                         if el.is_visible():
@@ -183,7 +179,7 @@ def login_keycloak(page, email: str, password: str):
                             return True
             except Exception:
                 continue
-        # label/placeholder fallbacks
+        # Fallbacks via label / placeholder / role
         if value == email:
             fallbacks = [
                 doc.get_by_label("Email", exact=False),
@@ -216,15 +212,14 @@ def login_keycloak(page, email: str, password: str):
                 b = doc.get_by_role("button", name=nm, exact=False)
                 if b and b.count() and b.first.is_visible():
                     b.first.click()
-                    doc.wait_for_timeout(300)
+                    doc.wait_for_timeout(250)
                     return
             except Exception:
                 continue
 
     def _attempt(doc) -> bool:
-        # wait for interactive elements
         try:
-            doc.wait_for_selector("input,button,form", timeout=15000)
+            doc.wait_for_selector("input,button,form", timeout=PW_DEFAULT_TIMEOUT_MS)
         except Exception:
             return False
 
@@ -243,8 +238,8 @@ def login_keycloak(page, email: str, password: str):
             if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
                 return True
 
-        # Password phase (if shown)
-        doc.wait_for_timeout(600)
+        # Password phase
+        doc.wait_for_timeout(400)
         pw_candidates = [
             "#password", "input#password", "input[name='password']",
             "input[type='password']", "input[autocomplete='current-password']",
@@ -255,24 +250,26 @@ def login_keycloak(page, email: str, password: str):
             if "web.quartr.com" in page.url and "auth.quartr.com" not in page.url:
                 return True
 
-        # maybe email-only redirect
+        # Maybe email-only redirect happened
         return "web.quartr.com" in page.url and "auth.quartr.com" not in page.url
 
-    # main page first
+    logger.info("LOGIN: attempt on main page")
     if _attempt(page):
+        logger.info("LOGIN: success on main page")
         return
 
-    # any iframe
+    logger.info("LOGIN: attempt in iframes")
     frame_urls = []
     for fr in page.frames:
         try:
             frame_urls.append(fr.url)
             if _attempt(fr):
+                logger.info("LOGIN: success in iframe")
                 return
         except Exception:
             continue
 
-    # failure: dump artifacts + diagnostics
+    # Failure diagnostics
     png = _link_png("login_fail")
     html = _link_html("login_fail")
     raise RuntimeError(
@@ -283,23 +280,24 @@ def login_keycloak(page, email: str, password: str):
 # ------------------ Company search (press '/' first) ------------------
 def open_company(page, ticker: str):
     """
-    Quartr requires pressing '/' to focus search.
-    Press '/', type ticker, Enter, then click result.
-    Fallbacks include visible search inputs and /search route.
+    Press '/', type ticker, Enter, then click a matching result.
+    Fallbacks: visible search inputs and direct search route.
     """
+    page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
     t = ticker.upper()
+    logger.info("OPEN: go home")
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(250)
+    page.wait_for_timeout(200)
 
-    # Try hotkey first
+    logger.info("OPEN: use '/' hotkey then Enter")
     try:
         page.keyboard.press("/")
-        page.wait_for_timeout(120)
+        page.wait_for_timeout(100)
         page.keyboard.type(t)
         page.keyboard.press("Enter")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     except Exception:
         pass
 
@@ -319,7 +317,6 @@ def open_company(page, ticker: str):
                     return True
             except Exception:
                 continue
-        # clickable ancestor of a text node
         try:
             el = ctx.get_by_text(t, exact=False).first
             el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
@@ -331,7 +328,7 @@ def open_company(page, ticker: str):
     if _click_first_match(page):
         return
 
-    # Fallback: visible search inputs
+    logger.info("OPEN: try visible search inputs")
     search_boxes = [
         page.get_by_placeholder("Search"),
         page.get_by_role("combobox", name="Search", exact=False),
@@ -346,13 +343,13 @@ def open_company(page, ticker: str):
                 sb.first.fill(t)
                 page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(300)
                 if _click_first_match(page):
                     return
             except Exception:
                 continue
 
-    # Fallback: direct search route
+    logger.info("OPEN: try direct /search route")
     try:
         page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
@@ -367,6 +364,7 @@ def open_company(page, ticker: str):
 
 # ------------------ Quarter open ------------------
 def open_quarter(page, year: int, quarter: str) -> bool:
+    page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
     labels = [f"{quarter} {year}", f"{quarter} FY{year}", f"{quarter} {str(year)[-2:]}"]
     for lb in labels:
         loc = page.get_by_text(lb, exact=False)
@@ -374,7 +372,7 @@ def open_quarter(page, year: int, quarter: str) -> bool:
             try:
                 loc.first.click()
                 page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(300)
                 _save_png(page, f"open_quarter_{year}_{quarter}")
                 return True
             except Exception:
@@ -402,6 +400,8 @@ def envcheck():
         "SUPABASE_URL": bool(SUPABASE_URL),
         "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
         "SUPABASE_BUCKET": SUPABASE_BUCKET,
+        "BACKFILL_MAX_SECONDS": BACKFILL_MAX_SECONDS,
+        "PW_DEFAULT_TIMEOUT_MS": PW_DEFAULT_TIMEOUT_MS,
     }
 
 @app.get("/diag")
@@ -423,6 +423,21 @@ def backfill(req: BackfillRequest):
     def qn(q: str) -> int:
         return int(q.replace("Q", ""))
 
+    start = time.monotonic()
+
+    def _check_watchdog(step: str):
+        elapsed = time.monotonic() - start
+        if elapsed > BACKFILL_MAX_SECONDS:
+            # last snapshot for context
+            try:
+                _save_png(page, f"watchdog_timeout_{int(elapsed)}s")
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=504,
+                detail=f"Backfill exceeded {BACKFILL_MAX_SECONDS}s at step: {step}"
+            )
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -430,14 +445,17 @@ def backfill(req: BackfillRequest):
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
             )
             page = browser.new_page()
+            page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
 
-            # 1) Login
+            logger.info("STEP 1: login")
             login_keycloak(page, QUARTR_EMAIL, QUARTR_PASSWORD)
+            _check_watchdog("login")
 
-            # 2) Company page
+            logger.info("STEP 2: open company")
             open_company(page, req.ticker)
+            _check_watchdog("open_company")
 
-            # 3) Iterate quarters
+            logger.info("STEP 3: iterate quarters")
             start_qn = qn(req.start_q)
             end_qn = qn(req.end_q)
             for year in range(req.start_year, req.end_year + 1):
@@ -445,14 +463,27 @@ def backfill(req: BackfillRequest):
                 q_to   = end_qn   if year == req.end_year   else 4
                 for qi in range(q_from, q_to + 1):
                     qlabel = f"Q{qi}"
-                    if not open_quarter(page, year, qlabel):
+                    ok = open_quarter(page, year, qlabel)
+                    _check_watchdog(f"open_quarter {year} {qlabel}")
+                    if not ok:
                         _save_png(page, f"open_quarter_fail_{req.ticker}_{year}_{qlabel}")
                         continue
-                    # TODO: add download/upload logic here
+                    # TODO: add download/upload logic here (bounded waits, expect_download with 15s timeout)
 
-            browser.close()
             return {"status": "ok"}
 
+    except HTTPException:
+        # watchdog already produced a clean HTTP error
+        raise
+    except PWTimeoutError as e:
+        logger.exception("Playwright timeout")
+        raise HTTPException(status_code=504, detail=f"Playwright timeout: {e}")
     except Exception as e:
         logger.exception("Backfill failed")
         raise HTTPException(status_code=500, detail=f"Backfill failed: {e}")
+    finally:
+        # Always try to close the browser to avoid zombie processes
+        try:
+            browser.close()
+        except Exception:
+            pass
