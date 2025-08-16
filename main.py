@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-app = FastAPI(title="Quartr Loader", version="3.1")
+app = FastAPI(title="Quartr Loader", version="3.2")
 
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL", "")
 QUARTR_PASSWORD = os.getenv("QUARTR_PASSWORD", "")
@@ -26,7 +26,7 @@ TMP_DIR = "/tmp"
 
 # Preferred company names when a ticker is ambiguous
 PREFERRED_COMPANY_BY_TICKER = {
-    "PCOR": ["Procore"],  # extend as needed, e.g., "SHOP": ["Shopify"], ...
+    "PCOR": ["Procore"],  # extend as needed
 }
 
 # ───────────────────────── Models ─────────────────────────
@@ -428,7 +428,7 @@ def open_company(page, ticker: str):
     html = _save_html(page, f"open_company_fail_{t}")
     raise RuntimeError(f"Could not open company for {t}. PNG: /debug/snap/{png} HTML: /debug/html/{html}")
 
-# ───────────────────────── Open quarter ─────────────────────────
+# ───────────────────────── Open quarter + Assets ─────────────────────────
 def open_quarter(page, year: int, quarter: str) -> bool:
     page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
     labels = [f"{quarter} {year}", f"{quarter} FY{year}", f"{quarter} {str(year)[-2:]}"]
@@ -444,6 +444,126 @@ def open_quarter(page, year: int, quarter: str) -> bool:
             except Exception:
                 continue
     return False
+
+def _ensure_year_visible(page, year: int):
+    """
+    Tries to set the 'Earlier events' year dropdown to the requested year.
+    If not found, we proceed (cards usually include the year anyway).
+    """
+    page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
+    # Try a generic dropdown near 'Earlier events'
+    try:
+        sec = page.locator("section:has-text('Earlier events'), div:has(> h2:has-text('Earlier events'))").first
+        if sec and sec.count():
+            # Look for a button with the current year text
+            ybtn = sec.get_by_role("button", name=str(year), exact=False)
+            if ybtn.count():
+                ybtn.first.click()
+                page.wait_for_timeout(150)
+                opt = page.get_by_role("menuitem", name=str(year), exact=True)
+                if opt.count():
+                    opt.first.click()
+                    page.wait_for_timeout(150)
+                    return
+    except Exception:
+        pass
+    # Fallback: do nothing
+
+def _open_event_card(page, year: int, quarter: str) -> bool:
+    """
+    Clicks the event card like 'Q1 2025' inside the 'Earlier events' section.
+    """
+    page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
+
+    # Ensure 'Earlier events' on-screen
+    for sec_sel in ["section:has-text('Earlier events')", "div:has(> h2:has-text('Earlier events'))", "text=Earlier events"]:
+        sec = page.locator(sec_sel)
+        if sec.count():
+            try:
+                sec.first.scroll_into_view_if_needed(timeout=800)
+                break
+            except Exception:
+                pass
+
+    label_variants = [f"{quarter} {year}", f"{quarter.upper()} {year}", f"{quarter.capitalize()} {year}"]
+    for lb in label_variants:
+        for card_sel in [
+            f"[class*='card']:has-text('{lb}')",
+            f"article:has-text('{lb}')",
+            f"div:has-text('{lb}')",
+            f"button:has-text('{lb}')",
+            f"a:has-text('{lb}')",
+        ]:
+            loc = page.locator(card_sel)
+            if loc.count():
+                try:
+                    el = loc.first
+                    el.scroll_into_view_if_needed(timeout=800)
+                    try:
+                        el.click()
+                    except Exception:
+                        el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
+                    page.wait_for_load_state("networkidle")
+                    _save_png(page, f"opened_event_{year}_{quarter}")
+                    return True
+                except Exception:
+                    continue
+    _save_png(page, f"open_event_fail_{year}_{quarter}")
+    return False
+
+def _collect_asset_links_from_event(page) -> dict:
+    """
+    On an opened event row, collect Press release / Transcript / Slides URLs.
+    Returns dict: { 'press_release': url_or_None, 'transcript': url_or_None, 'slides': url_or_None }.
+    """
+    page.set_default_timeout(PW_DEFAULT_TIMEOUT_MS)
+    assets = {"press_release": None, "transcript": None, "slides": None}
+
+    text_candidates = {
+        "press_release": ["Press release", "Press Release", "Release"],
+        "transcript": ["Transcript", "Call transcript"],
+        "slides": ["Slides", "Presentation", "Deck"]
+    }
+    for key, texts in text_candidates.items():
+        for txt in texts:
+            try:
+                a = page.get_by_role("link", name=txt, exact=False)
+                if a.count():
+                    href = a.first.get_attribute("href")
+                    if href:
+                        assets[key] = href
+                        break
+            except Exception:
+                continue
+
+    if not all(assets.values()):
+        buttons = page.locator("a, button, [role='button']")
+        count = min(buttons.count(), 80)
+        for i in range(count):
+            try:
+                el = buttons.nth(i)
+                title = (el.get_attribute("title") or "").lower()
+                aria = (el.get_attribute("aria-label") or "").lower()
+                text = (el.inner_text() or "").lower()
+                target = (title + " " + aria + " " + text)
+
+                def set_if(key, *needles):
+                    nonlocal assets
+                    if assets[key] is None and any(n in target for n in needles):
+                        href = el.get_attribute("href")
+                        if href:
+                            assets[key] = href
+
+                set_if("press_release", "press", "release", "pr")
+                set_if("transcript", "transcript", "call")
+                set_if("slides", "slides", "presentation", "deck")
+
+            except Exception:
+                continue
+
+    _save_html(page, "event_assets_html")
+    _save_png(page, "event_assets_png")
+    return assets
 
 # ───────────────────────── Backfill route (with watchdog) ─────────────────────────
 @app.post("/backfill")
@@ -483,21 +603,41 @@ def backfill(req: BackfillRequest):
             open_company(page, req.ticker)
             watchdog("open_company", page)
 
-            logger.info("STEP 3: iterate quarters")
+            logger.info("STEP 3: iterate quarters and collect assets")
             start_qn = qn(req.start_q); end_qn = qn(req.end_q)
+            collected = []
             for year in range(req.start_year, req.end_year + 1):
                 q_from = start_qn if year == req.start_year else 1
                 q_to   = end_qn   if year == req.end_year   else 4
+
+                # Keep the page in a known state (company overview)
+                if "/company/" not in page.url:
+                    # best-effort: go back to company page
+                    page.goto(f"https://web.quartr.com/search?q={req.ticker}", wait_until="domcontentloaded")
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(200)
+
                 for qi in range(q_from, q_to + 1):
                     qlabel = f"Q{qi}"
-                    ok = open_quarter(page, year, qlabel)
-                    watchdog(f"open_quarter_{year}_{qlabel}", page)
+                    _ensure_year_visible(page, year)
+                    ok = _open_event_card(page, year, qlabel)
+                    watchdog(f"open_event_{year}_{qlabel}", page)
                     if not ok:
-                        _save_png(page, f"open_quarter_fail_{req.ticker}_{year}_{qlabel}")
+                        _save_png(page, f"open_event_fail_{req.ticker}_{year}_{qlabel}")
                         continue
-                    # TODO: add download/upload logic here
 
-            return {"status": "ok", "ticker": req.ticker}
+                    links = _collect_asset_links_from_event(page)
+                    logger.info(f"Assets for {req.ticker} {qlabel} {year}: {links}")
+                    collected.append({"ticker": req.ticker, "year": year, "quarter": qlabel, **links})
+
+                    # try to return to company overview after each event
+                    try:
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(150)
+                    except Exception:
+                        pass
+
+            return {"status": "ok", "ticker": req.ticker, "assets": collected}
 
     except HTTPException:
         raise
