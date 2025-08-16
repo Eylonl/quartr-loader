@@ -1,30 +1,40 @@
 import os
 import time
 import logging
-from typing import Optional
+from typing import Optional, List
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
-import httpx
+
+# Supabase diag support
+from supabase import create_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(title="Quartr Loader", version="2.1")
 
-# Environment variables
+# ------------------ Environment ------------------
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL")
 QUARTR_PASSWORD = os.getenv("QUARTR_PASSWORD")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "earnings")
 
-if not QUARTR_EMAIL or not QUARTR_PASSWORD or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logger.warning("Missing one or more required environment variables.")
+def _require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return val
 
+def _sb_client():
+    url = _require_env("SUPABASE_URL")
+    key = _require_env("SUPABASE_SERVICE_ROLE_KEY")
+    return create_client(url, key)
 
-# ------------------ Debug helpers ------------------
-
+# ------------------ Debug helpers & endpoints ------------------
 def _save_png(page, tag: str) -> str:
     """Save a full-page PNG to /tmp and log a direct URL you can click."""
     fname = f"debug_{tag}_{int(time.time())}.png"
@@ -35,7 +45,6 @@ def _save_png(page, tag: str) -> str:
     except Exception as e:
         logger.error("Failed to save PNG: %s", e)
     return fname
-
 
 def _save_html(page, tag: str) -> str:
     """Save current HTML to /tmp and log a direct URL you can click."""
@@ -50,69 +59,101 @@ def _save_html(page, tag: str) -> str:
         logger.error("Failed to save HTML: %s", e)
     return fname
 
+@app.get("/debug/list_tmp")
+def debug_list_tmp():
+    files = [f for f in os.listdir("/tmp") if f.endswith(".png") or f.endswith(".html")]
+    return {"files": files}
+
+@app.get("/debug/snap/{fname}")
+def debug_snap(fname: str):
+    safe = os.path.basename(fname)
+    path = f"/tmp/{safe}"
+    if not os.path.exists(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path, media_type="image/png")
+
+@app.get("/debug/html/{fname}")
+def debug_html(fname: str):
+    safe = os.path.basename(fname)
+    path = f"/tmp/{safe}"
+    if not os.path.exists(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    with open(path, "r", encoding="utf-8") as f:
+        return PlainTextResponse(f.read(), media_type="text/html")
 
 # ------------------ Quartr login ------------------
-
-def login_keycloak(page, email, password):
-    """Log in to Quartr via Keycloak."""
+def login_keycloak(page, email: str, password: str):
+    """
+    Simple 2-step flow: fill Email -> Enter; then fill Password -> Enter.
+    If already logged in, returns immediately.
+    """
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_timeout(500)
 
-    # If already logged in
-    if "home" in page.url and "auth" not in page.url:
+    # already in app?
+    if "web.quartr.com" in page.url and "auth" not in page.url:
         return
 
+    # If a 'Log in' link exists, click it (some tenants)
     try:
         page.get_by_role("link", name="Log in").click()
     except Exception:
         pass
 
-    # Email
-    email_input = page.get_by_label("Email", exact=False)
-    if email_input.count() == 0:
-        email_input = page.locator("input[type='email']")
-    email_input.fill(email)
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(500)
+    # ---- Step 1: Email ----
+    try:
+        email_input = page.get_by_label("Email", exact=False)
+        if email_input.count() == 0:
+            email_input = page.locator("input[type='email'], #username, input[name='username'], input[name='email']")
+        email_input.first.fill(email)
+    except Exception:
+        _save_png(page, "login_no_email_field")
+        raise RuntimeError("Couldn't find email field on login page.")
 
-    # Password
-    pwd_input = page.get_by_label("Password", exact=False)
-    if pwd_input.count() == 0:
-        pwd_input = page.locator("input[type='password']")
-    pwd_input.fill(password)
     page.keyboard.press("Enter")
+    page.wait_for_timeout(700)
+
+    # ---- Step 2: Password (if prompted) ----
+    try:
+        pwd_input = page.get_by_label("Password", exact=False)
+        if pwd_input.count() == 0:
+            pwd_input = page.locator("input[type='password'], #password, input[name='password']")
+        if pwd_input.count():
+            pwd_input.first.fill(password)
+            page.keyboard.press("Enter")
+    except Exception:
+        # Some tenants auto-complete or do passwordless SSO; proceed
+        pass
+
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1500)
 
-    if "home" not in page.url:
+    if "web.quartr.com" not in page.url:
         _save_png(page, "login_fail")
         raise RuntimeError(f"Keycloak login failed; final URL: {page.url}")
 
-
 # ------------------ Company search ------------------
-
 def open_company(page, ticker: str):
     """
     Quartr requires pressing '/' to focus search.
-    This tries that first, then falls back to clicking visible search inputs.
-    Finally it clicks the first result that mentions the ticker.
-    Saves a debug PNG with a clickable URL if it fails.
+    This presses '/', types ticker, Enter, and then clicks the first result.
+    Falls back to visible search inputs and a direct search URL.
     """
     t = ticker.upper()
 
     # Always start from home
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(300)
 
-    # Strategy A: '/' hotkey
+    # Strategy A: '/' hotkey first
     try:
         page.keyboard.press("/")
         page.wait_for_timeout(150)
         page.keyboard.type(t)
         page.keyboard.press("Enter")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(700)
     except Exception:
         pass
 
@@ -160,17 +201,17 @@ def open_company(page, ticker: str):
                 sb.first.fill(t)
                 page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(700)
                 if _click_first_match(page):
                     return
             except Exception:
                 continue
 
-    # Strategy C: direct URL
+    # Strategy C: direct route
     try:
         page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(700)
         if _click_first_match(page):
             return
     except Exception:
@@ -179,15 +220,15 @@ def open_company(page, ticker: str):
     fname = _save_png(page, f"open_company_fail_{t}")
     raise RuntimeError(f"Could not open company from search UI. See /debug/snap/{fname}")
 
-
 # ------------------ Models ------------------
-
 class BackfillRequest(BaseModel):
     ticker: str
     extra: Optional[str] = None
 
-
 # ------------------ Routes ------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 @app.get("/envcheck")
 def envcheck():
@@ -196,23 +237,46 @@ def envcheck():
         "QUARTR_PASSWORD": bool(QUARTR_PASSWORD),
         "SUPABASE_URL": bool(SUPABASE_URL),
         "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
-        "SUPABASE_BUCKET": SUPABASE_BUCKET
+        "SUPABASE_BUCKET": SUPABASE_BUCKET,
     }
 
+@app.get("/diag")
+def diag():
+    """
+    Checks Supabase connectivity and lists the first-level objects in the bucket.
+    """
+    try:
+        sb = _sb_client()
+        bucket = SUPABASE_BUCKET
+        # list root of the bucket
+        items: List[dict] = sb.storage.from_(bucket).list() or []
+        # keep it short in the response
+        names = [i.get("name") for i in items][:50]
+        return {"ok": True, "bucket": bucket, "count": len(items), "sample": names}
+    except Exception as e:
+        logger.exception("Diag failed")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.post("/backfill")
 def backfill(req: BackfillRequest):
+    if not QUARTR_EMAIL or not QUARTR_PASSWORD:
+        raise HTTPException(status_code=500, detail="Missing QUARTR_EMAIL or QUARTR_PASSWORD")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+            )
             page = browser.new_page()
 
+            # Login and take a screenshot you can click from logs
             login_keycloak(page, QUARTR_EMAIL, QUARTR_PASSWORD)
             _save_png(page, "after_login_home")
 
+            # Go to company page (now uses '/' first)
             open_company(page, req.ticker)
 
-            # TODO: implement download + upload logic here
+            # TODO: add your downloads & Supabase uploads here.
 
             browser.close()
             return {"status": "ok"}
