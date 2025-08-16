@@ -12,9 +12,9 @@ from playwright.sync_api import sync_playwright
 from supabase import create_client
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("main")
 
-app = FastAPI(title="Quartr Loader", version="2.1")
+app = FastAPI(title="Quartr Loader", version="2.2")
 
 # ------------------ Environment ------------------
 QUARTR_EMAIL = os.getenv("QUARTR_EMAIL")
@@ -132,51 +132,75 @@ def login_keycloak(page, email: str, password: str):
         _save_png(page, "login_fail")
         raise RuntimeError(f"Keycloak login failed; final URL: {page.url}")
 
-# ------------------ Company search ------------------
+# ------------------ Company search (robust, '/' first) ------------------
 def open_company(page, ticker: str):
     """
     Quartr requires pressing '/' to focus search.
-    This presses '/', types ticker, Enter, and then clicks the first result.
+    This presses '/', types ticker, Enter, waits for results containers,
+    then clicks the first result mentioning the ticker.
     Falls back to visible search inputs and a direct search URL.
+    Dumps PNG + HTML on failure.
     """
     t = ticker.upper()
 
     # Always start from home
     page.goto("https://web.quartr.com/home", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(250)
 
     # Strategy A: '/' hotkey first
     try:
         page.keyboard.press("/")
-        page.wait_for_timeout(150)
+        page.wait_for_timeout(120)
         page.keyboard.type(t)
         page.keyboard.press("Enter")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(700)
     except Exception:
         pass
 
+    # Wait for any plausible results container
+    possible_containers = [
+        "role=listbox",
+        "role=list",
+        "role=grid",
+        "section:has-text('Search')",
+        "[data-testid*='search']",
+        "div[role='navigation'] >> .. >> div:has-text('Search')",
+    ]
+    for sel in possible_containers:
+        try:
+            page.wait_for_selector(sel, timeout=1500)
+            break
+        except Exception:
+            continue  # not fatal
+
+    # Try clicking a matching result
     def _click_first_match(ctx) -> bool:
-        for loc in (
+        # Try common link/button/card patterns containing the ticker
+        candidates = [
             ctx.get_by_role("link", name=t, exact=False),
+            ctx.get_by_role("button", name=t, exact=False),
             ctx.locator(f"a:has-text('{t}')"),
-        ):
-            if loc.count():
-                try:
+            ctx.locator(f"button:has-text('{t}')"),
+            ctx.locator(f"[data-testid*='result']:has-text('{t}')"),
+            ctx.locator(f"[data-testid*='company']:has-text('{t}')"),
+            ctx.locator(f"[class*='card']:has-text('{t}')"),
+            ctx.locator(f"text={t}"),
+        ]
+        for loc in candidates:
+            try:
+                if loc and loc.count():
                     loc.first.click()
                     ctx.wait_for_load_state("networkidle")
                     return True
-                except Exception:
-                    pass
+            except Exception:
+                continue
+        # As a last resort: clickable ancestor of any text match
         generic = ctx.get_by_text(t, exact=False)
-        if generic.count():
+        if generic and generic.count():
             try:
                 el = generic.first
-                try:
-                    el.click()
-                except Exception:
-                    el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
+                el.locator("xpath=ancestor-or-self::*[self::a or self::button][1]").first.click()
                 ctx.wait_for_load_state("networkidle")
                 return True
             except Exception:
@@ -201,7 +225,7 @@ def open_company(page, ticker: str):
                 sb.first.fill(t)
                 page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(700)
+                page.wait_for_timeout(500)
                 if _click_first_match(page):
                     return
             except Exception:
@@ -211,14 +235,15 @@ def open_company(page, ticker: str):
     try:
         page.goto(f"https://web.quartr.com/search?q={t}", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(700)
         if _click_first_match(page):
             return
     except Exception:
         pass
 
-    fname = _save_png(page, f"open_company_fail_{t}")
-    raise RuntimeError(f"Could not open company from search UI. See /debug/snap/{fname}")
+    # Debug artifacts
+    png = _save_png(page, f"open_company_fail_{t}")
+    html = _save_html(page, f"open_company_fail_{t}")
+    raise RuntimeError(f"Could not open company from search UI. See /debug/snap/{png} and /debug/html/{html}")
 
 # ------------------ Models ------------------
 class BackfillRequest(BaseModel):
@@ -248,9 +273,7 @@ def diag():
     try:
         sb = _sb_client()
         bucket = SUPABASE_BUCKET
-        # list root of the bucket
         items: List[dict] = sb.storage.from_(bucket).list() or []
-        # keep it short in the response
         names = [i.get("name") for i in items][:50]
         return {"ok": True, "bucket": bucket, "count": len(items), "sample": names}
     except Exception as e:
@@ -273,7 +296,7 @@ def backfill(req: BackfillRequest):
             login_keycloak(page, QUARTR_EMAIL, QUARTR_PASSWORD)
             _save_png(page, "after_login_home")
 
-            # Go to company page (now uses '/' first)
+            # Go to company page (now uses '/' first, waits for containers, many selectors)
             open_company(page, req.ticker)
 
             # TODO: add your downloads & Supabase uploads here.
